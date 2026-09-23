@@ -22,6 +22,100 @@ begin
 end;
 ```
 
+## Why WalKey?
+
+- **One interface, several backends.** Memory, a file tree on disk, NATS
+  JetStream and a null store today; Code written against `IKeyValue` runs on 
+  any of them unchanged.
+- **TTL everywhere.** Expiry is part of the stored entry, not something the
+  backend has to support, so it behaves the same on every store.
+- **Collections.** Keys are grouped into named namespaces, on every backend.
+- **Wrappers that stack.** Prefixing, read-only, TTL clamping, logging,
+  statistics, fallback and thread safety, each one an `IKeyValue` around
+  another, combined in any order.
+- **Typed access** with Neon: `TKVNeonAdapter<T>` stores Delphi records and 
+  objects as plain JSON, readable by anything else that opens the store.
+- **No dependencies in the core.** The stores and wrappers need nothing but
+  the RTL.
+- **A conformance suite.** Write a store, point the shared tests at it, and the
+  whole contract is checked for you.
+
+## For framework authors
+
+A key-value store is useful in an application, but WalKey pays off most inside
+a **framework or library** that has to keep state it does not own: caches,
+tokens, sessions, rate-limit counters, discovery documents.
+
+A framework that picks the storage itself forces that choice on every
+application built on it. One that asks for an `IKeyValue` instead leaves the
+choice to the application: memory while developing, a file tree on a single
+server, NATS (and, in time, Redis) once there are several instances sharing
+state, and the null store in tests. The framework code is the same in every
+case.
+
+### Real-world example: MCPConnect
+
+[MCPConnect](https://github.com/delphi-blocks/MCPConnect), the Delphi framework
+for building MCP servers, has exactly this kind of state in its OAuth layer:
+
+- **Authorization server metadata and signing keys (JWKS)**, fetched from the
+  identity provider and cached with their own TTLs, so a token can be verified
+  without a network round trip on every request.
+- **Proxied metadata documents**, which the OAuth middleware keeps for every
+  client of a server to share, instead of fetching them again for each one.
+
+These are the caches that are no longer enough once the server runs as more
+than one instance: each instance fetches everything again and holds its own
+copy. Backed by an `IKeyValue`, the application decides where they live:
+
+- Development: `TKVMemoryStore` — nothing to set up
+- A single server: `TKVFileTreeStore` — the cache survives a restart
+- Several instances: `TKVNatsStore` — one shared cache for all of them
+- Tests: `TKVNullStore` — no state carried from one test to the next
+
+### Using WalKey in your framework
+
+1. **Ask for the interface**, not a store:
+
+   ```pascal
+   type
+     TMyFramework = class
+     private
+       FCache: IKeyValue;
+     public
+       constructor Create(const ACache: IKeyValue);
+     end;
+   ```
+
+2. **Use it through the plain operations**, with a collection of your own and
+   a TTL where the data goes stale:
+
+   ```pascal
+   FCache.Put('session-123', '{"user":"456"}', 'sessions', 3600);
+
+   if FCache.TryGet('session-123', 'sessions', LJson) then
+     ...
+   ```
+
+3. **Let the application choose the backend**:
+
+   ```pascal
+   // Development
+   LFramework := TMyFramework.Create(TKVMemoryStore.Create);
+
+   // Production, on disk
+   LFramework := TMyFramework.Create(
+     TKVFileTreeStore.Create('C:\ProgramData\MyApp\cache'));
+
+   // Production, shared between instances, one tenant's namespace
+   LFramework := TMyFramework.Create(
+     TKVPrefixKeysWrapper.Create(TKVNatsStore.Create(LJs, 'myapp'), 'tenant-7'));
+   ```
+
+By depending on `WalKey.Core` rather than on a particular store, a framework
+stays backend-agnostic and leaves storage where it belongs: with the
+application that deploys it.
+
 ## The model
 
 - **Values are JSON text.** Nothing in the library parses a value: it is an
