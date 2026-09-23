@@ -1,4 +1,14 @@
-# WalKey
+# WalKey: Delphi Key-Value Library
+
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="walkey-for-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="walkey-for-light.png">
+  <img alt="WalKey Logo" src="walkey-for-light.png" width="400">
+</picture>
+</div>
+
+---
 
 **Pluggable key-value stores for Delphi.** One interface, any backend.
 
