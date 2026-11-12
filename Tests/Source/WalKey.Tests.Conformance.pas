@@ -23,11 +23,40 @@ unit WalKey.Tests.Conformance;
 interface
 
 uses
-  System.SysUtils, System.DateUtils,
+  System.SysUtils, System.DateUtils, System.Classes, System.SyncObjs,
+  System.Generics.Collections,
   DUnitX.TestFramework,
   WalKey.Core;
 
 type
+  /// <summary>
+  ///   Collects what a watch reports, from whatever thread reports it, and
+  ///   lets a test wait for a key to turn up. A store may report a moment
+  ///   after the write - NATS does - so waiting is part of the contract, not
+  ///   a sleep in disguise.
+  /// </summary>
+  TKVChangeLog = class
+  private
+    FLock: TCriticalSection;
+    FKeys: TList<string>;
+    FChanged: TEvent;
+    procedure Add(const AKey: string);
+  public
+    constructor Create;
+    destructor Destroy; override;
+    /// <summary>
+    ///   The handler to give a watch. Release the watch before the log.
+    /// </summary>
+    function Handler: TKVChangeProc;
+    /// <summary>
+    ///   Waits until AKey has been reported; False if it is not, in the time
+    ///   allowed.
+    /// </summary>
+    function WaitFor(const AKey: string; const ATimeoutMs: Cardinal = 5000): Boolean;
+    function Contains(const AKey: string): Boolean;
+    function Count: Integer;
+  end;
+
   TKVConformanceTests = class abstract
   private
     FNow: TDateTime;
@@ -119,6 +148,14 @@ type
     [Test] procedure Cullable_RemovesExpiredEntries;
     [Test] procedure Destroyable_DropsOneCollection;
     [Test] procedure Destroyable_DropsEverything;
+    [Test] procedure Watchable_ReportsAPut;
+    [Test] procedure Watchable_ReportsADelete;
+    [Test] procedure Watchable_ReportsTheKeyAsWritten;
+    [Test] procedure Watchable_EmptyCollection_WatchesTheDefaultOne;
+    [Test] procedure Watchable_IgnoresOtherCollections;
+    [Test] procedure Watchable_StopsWhenReleased;
+    [Test] procedure Watchable_NilHandler_Raises;
+    [Test] procedure Watchable_InvalidCollection_Raises;
   end;
 
 implementation
@@ -126,6 +163,80 @@ implementation
 const
   VALUE_A = '{"name":"Alice"}';
   VALUE_B = '{"name":"Bob"}';
+
+{ TKVChangeLog }
+
+constructor TKVChangeLog.Create;
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FKeys := TList<string>.Create;
+  FChanged := TEvent.Create(nil, False, False, '');
+end;
+
+destructor TKVChangeLog.Destroy;
+begin
+  FChanged.Free;
+  FKeys.Free;
+  FLock.Free;
+  inherited;
+end;
+
+procedure TKVChangeLog.Add(const AKey: string);
+begin
+  FLock.Enter;
+  try
+    FKeys.Add(AKey);
+  finally
+    FLock.Leave;
+  end;
+  FChanged.SetEvent;
+end;
+
+function TKVChangeLog.Handler: TKVChangeProc;
+begin
+  Result :=
+    procedure (const AKey: string)
+    begin
+      Add(AKey);
+    end;
+end;
+
+function TKVChangeLog.Contains(const AKey: string): Boolean;
+begin
+  FLock.Enter;
+  try
+    Result := FKeys.Contains(AKey);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TKVChangeLog.Count: Integer;
+begin
+  FLock.Enter;
+  try
+    Result := FKeys.Count;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TKVChangeLog.WaitFor(const AKey: string; const ATimeoutMs: Cardinal): Boolean;
+var
+  LDeadline: UInt64;
+  LNow: UInt64;
+begin
+  LDeadline := TThread.GetTickCount64 + ATimeoutMs;
+  repeat
+    if Contains(AKey) then
+      Exit(True);
+    LNow := TThread.GetTickCount64;
+    if LNow >= LDeadline then
+      Exit(False);
+    FChanged.WaitFor(Cardinal(LDeadline - LNow));
+  until False;
+end;
 
 { TKVConformanceTests }
 
@@ -569,6 +680,205 @@ begin
 
   Assert.AreEqual('', Store.Get('a', 'one'));
   Assert.AreEqual('', Store.Get('a', 'two'));
+end;
+
+{ A store may need a collection to exist before it can watch it - NATS has no
+  bucket to watch until the first write - so each watch test writes a seed
+  entry first. }
+
+procedure TKVConformanceTests.Watchable_ReportsAPut;
+var
+  LWatchable: IKeyValueWatchable;
+  LLog: TKVChangeLog;
+  LWatch: IKVWatch;
+begin
+  if not Supports(Store, IKeyValueWatchable, LWatchable) then
+    Exit;
+
+  Store.Put('seed', VALUE_A, 'watched');
+  LLog := TKVChangeLog.Create;
+  try
+    LWatch := LWatchable.Watch('watched', LLog.Handler());
+    try
+      Assert.IsTrue(LWatch.IsLive);
+      Store.Put('a', VALUE_A, 'watched');
+      Assert.IsTrue(LLog.WaitFor('a'), 'the put is reported');
+      Assert.IsFalse(LLog.Contains('seed'), 'what was there before is not a change');
+    finally
+      LWatch := nil;
+    end;
+  finally
+    LLog.Free;
+  end;
+end;
+
+procedure TKVConformanceTests.Watchable_ReportsADelete;
+var
+  LWatchable: IKeyValueWatchable;
+  LLog: TKVChangeLog;
+  LWatch: IKVWatch;
+begin
+  if not Supports(Store, IKeyValueWatchable, LWatchable) then
+    Exit;
+
+  Store.Put('a', VALUE_A, 'watched');
+  LLog := TKVChangeLog.Create;
+  try
+    LWatch := LWatchable.Watch('watched', LLog.Handler());
+    try
+      Assert.IsTrue(Store.Delete('a', 'watched'));
+      Assert.IsTrue(LLog.WaitFor('a'), 'the delete is reported');
+    finally
+      LWatch := nil;
+    end;
+  finally
+    LLog.Free;
+  end;
+end;
+
+procedure TKVConformanceTests.Watchable_ReportsTheKeyAsWritten;
+const
+  ODD_KEY = 'a key/with: odd.chars*>';
+var
+  LWatchable: IKeyValueWatchable;
+  LLog: TKVChangeLog;
+  LWatch: IKVWatch;
+begin
+  if not Supports(Store, IKeyValueWatchable, LWatchable) then
+    Exit;
+
+  Store.Put('seed', VALUE_A, 'watched');
+  LLog := TKVChangeLog.Create;
+  try
+    LWatch := LWatchable.Watch('watched', LLog.Handler());
+    try
+      Store.Put(ODD_KEY, VALUE_A, 'watched');
+      Assert.IsTrue(LLog.WaitFor(ODD_KEY),
+        'a key the backend has to encode is reported as the caller wrote it');
+    finally
+      LWatch := nil;
+    end;
+  finally
+    LLog.Free;
+  end;
+end;
+
+procedure TKVConformanceTests.Watchable_EmptyCollection_WatchesTheDefaultOne;
+var
+  LWatchable: IKeyValueWatchable;
+  LLog: TKVChangeLog;
+  LWatch: IKVWatch;
+begin
+  if not Supports(Store, IKeyValueWatchable, LWatchable) then
+    Exit;
+
+  Store.Put('seed', VALUE_A);
+  LLog := TKVChangeLog.Create;
+  try
+    LWatch := LWatchable.Watch('', LLog.Handler());
+    try
+      Store.Put('a', VALUE_A);
+      Assert.IsTrue(LLog.WaitFor('a'));
+    finally
+      LWatch := nil;
+    end;
+  finally
+    LLog.Free;
+  end;
+end;
+
+procedure TKVConformanceTests.Watchable_IgnoresOtherCollections;
+var
+  LWatchable: IKeyValueWatchable;
+  LLog: TKVChangeLog;
+  LWatch: IKVWatch;
+begin
+  if not Supports(Store, IKeyValueWatchable, LWatchable) then
+    Exit;
+
+  Store.Put('seed', VALUE_A, 'watched');
+  Store.Put('seed', VALUE_A, 'other');
+  LLog := TKVChangeLog.Create;
+  try
+    LWatch := LWatchable.Watch('watched', LLog.Handler());
+    try
+      Store.Put('x', VALUE_A, 'other');
+      Store.Put('y', VALUE_A, 'watched');
+      Assert.IsTrue(LLog.WaitFor('y'));
+      Assert.IsFalse(LLog.Contains('x'), 'a write to another collection is not reported');
+    finally
+      LWatch := nil;
+    end;
+  finally
+    LLog.Free;
+  end;
+end;
+
+procedure TKVConformanceTests.Watchable_StopsWhenReleased;
+var
+  LWatchable: IKeyValueWatchable;
+  LStopped, LRunning: TKVChangeLog;
+  LFirst, LSecond: IKVWatch;
+begin
+  if not Supports(Store, IKeyValueWatchable, LWatchable) then
+    Exit;
+
+  Store.Put('seed', VALUE_A, 'watched');
+  LStopped := TKVChangeLog.Create;
+  LRunning := TKVChangeLog.Create;
+  try
+    LFirst := LWatchable.Watch('watched', LStopped.Handler());
+    LSecond := LWatchable.Watch('watched', LRunning.Handler());
+    try
+      LFirst := nil;
+      Store.Put('a', VALUE_A, 'watched');
+
+      // The watch still running is the proof that the change went out at all.
+      Assert.IsTrue(LRunning.WaitFor('a'));
+      Assert.AreEqual(0, LStopped.Count, 'a released watch reports nothing');
+    finally
+      LFirst := nil;
+      LSecond := nil;
+    end;
+  finally
+    LRunning.Free;
+    LStopped.Free;
+  end;
+end;
+
+procedure TKVConformanceTests.Watchable_NilHandler_Raises;
+var
+  LWatchable: IKeyValueWatchable;
+begin
+  if not Supports(Store, IKeyValueWatchable, LWatchable) then
+    Exit;
+
+  Assert.WillRaise(
+    procedure
+    var
+      LWatch: IKVWatch;
+    begin
+      LWatch := LWatchable.Watch('watched', nil);
+    end, EKVArgumentError);
+end;
+
+procedure TKVConformanceTests.Watchable_InvalidCollection_Raises;
+var
+  LWatchable: IKeyValueWatchable;
+begin
+  if not Supports(Store, IKeyValueWatchable, LWatchable) then
+    Exit;
+
+  Assert.WillRaise(
+    procedure
+    var
+      LWatch: IKVWatch;
+    begin
+      LWatch := LWatchable.Watch('bad'#1,
+        procedure (const AKey: string)
+        begin
+        end);
+    end, EKVInvalidCollectionError);
 end;
 
 end.

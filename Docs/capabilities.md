@@ -1,7 +1,7 @@
 # Optional capabilities
 
 `IKeyValue` is what every store can do: read, write and delete one key, or many.
-Three more things are useful but cannot be promised by every backend, so each
+Four more things are useful but cannot be promised by every backend, so each
 has an interface of its own, and a store implements only the ones it can
 honour.
 
@@ -10,6 +10,7 @@ honour.
 | `IKeyValueEnumerable` | `Keys(collection)`, `Collections` | What is in here? |
 | `IKeyValueCullable` | `Cull` | Can expired entries be cleared out now, rather than when read? |
 | `IKeyValueDestroyable` | `DestroyCollection(name)`, `DestroyAll` | Can a whole collection, or everything, be dropped in one call? |
+| `IKeyValueWatchable` | `Watch(collection, handler)` | Can I be told when somebody else changes something? |
 
 All of them are declared in `WalKey.Core`.
 
@@ -24,7 +25,7 @@ implement all of them would either do some badly or raise from half of its own
 interface. A separate interface lets it say plainly: *not this one*.
 
 **Every wrapper would have to implement them.** A method on `IKeyValue` is a
-method on each of the seven wrappers, and several could not honour it: a
+method on every wrapper, and several could not honour it: a
 read-only wrapper must not hand out `DestroyAll`, and a prefixing one must not
 list keys under names its callers never used. See
 [Wrappers: the one rule](wrappers.md#the-one-rule).
@@ -65,8 +66,8 @@ Three things never offer a capability, whatever is underneath:
 - **A collection view.** `Store.Collection('users')` returns a `TKVCollectionView`,
   which implements `IKeyValue` and nothing else. Ask the store, and pass the
   collection name.
-- **Most wrappers.** Logging, statistics, the TTL clamp and the fallback
-  implement none. See [what each wrapper offers](#through-a-wrapper).
+- **Most wrappers.** Logging, statistics, the TTL clamp, the fallback and the
+  near cache implement none. See [what each wrapper offers](#through-a-wrapper).
 - **A plain `IKeyValue` you did not build.** It may be a view or a wrapper, and
   `Supports` is the only honest way to find out.
 
@@ -221,31 +222,96 @@ by key, so:
   store through a `TKVReadOnlyWrapper`, which refuses both calls, instead of
   relying on it not to call them.
 
+## IKeyValueWatchable
+
+```pascal
+TKVChangeProc = reference to procedure(const AKey: string);
+
+IKVWatch = interface
+  function IsLive: Boolean;
+end;
+
+function Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+```
+
+**`Watch`** reports every write and removal in one collection, made through
+this store or any other way to the same data, until the watch is released.
+Changes made after `Watch` returns are reported. Changes from before it are
+not. `''` is the default collection.
+
+What is reported is **which key** changed, not what it changed to. A key of
+`''` means the store cannot say which: anything in the collection may have
+changed, or the collection is gone (the memory store reports a
+`DestroyCollection` that way). Expiry is not a change: an entry that expires
+was already carrying the instant it would.
+
+**`IsLive`** answers whether every change is still being reported. Once it
+answers False, it never answers True again: changes may have been missed, and
+the way back is a new watch. It can be False from the start, for a collection
+the store cannot watch yet.
+
+The handler runs on whatever thread the store found out on: the writer's own
+for the memory store, the connection's reader thread for NATS. It may run
+while the store holds a lock. So it must be quick, it must not raise, and it
+**must not call the store**. Record what changed and act on it elsewhere.
+
+### Uses
+
+- **A cache that stays correct while others write.** This is what it exists
+  for, and `TKVNearCacheWrapper` is that cache. See
+  [Wrappers: TKVNearCacheWrapper](wrappers.md#tkvnearcachewrapper).
+- **Reacting to configuration changes**: watch a `config` collection and reload
+  a setting when its key is reported.
+
+### How the stores do it
+
+The memory store reports synchronously. By the time `Put` returns, every
+handler has run.
+
+The NATS store starts a JetStream KV watch on the collection's bucket (an
+ephemeral push consumer for new changes only), so a write by any client of the
+bucket is reported a moment after it lands. Two limits come from the medium:
+
+- **A dropped connection ends the watch for good**, even once the connection is
+  reopened, because the subscription under it is gone. `IsLive` notices a
+  connection that is down when it is asked. It cannot notice one that dropped
+  and came back between two calls. A bucket deleted from outside is not
+  reported either.
+- **A collection with no bucket cannot be watched.** `Watch` answers a watch
+  that is not live, and does not create the bucket to watch it.
+
+A consumer of the watch has to allow for the first limit. The near cache does:
+it trusts nothing for longer than its `MaxAge`.
+
 ## Who offers what
 
 ### The stores
 
-| | Enumerable | Cullable | Destroyable |
-|---|---|---|---|
-| `TKVMemoryStore` | yes | yes | yes |
-| `TKVFileTreeStore` | yes (reads every file) | yes (reads every file) | yes |
-| `TKVNullStore` | yes, always empty | yes, always 0 | yes, does nothing |
-| `TKVNatsStore` | yes (reads every value) | yes (reads every value) | yes (drops the bucket) |
+| | Enumerable | Cullable | Destroyable | Watchable |
+|---|---|---|---|---|
+| `TKVMemoryStore` | yes | yes | yes | yes, synchronous |
+| `TKVFileTreeStore` | yes (reads every file) | yes (reads every file) | yes | — |
+| `TKVNullStore` | yes, always empty | yes, always 0 | yes, does nothing | — |
+| `TKVNatsStore` | yes (reads every value) | yes (reads every value) | yes (drops the bucket) | yes, a KV watch |
 
-The null store offers all three so that swapping it in never changes which
+The file store does not watch: the filesystem can report changes, but not
+cheaply or reliably enough across processes and network shares to build a
+cache on.
+
+The null store offers the first three so that swapping it in never changes which
 code paths run. What it answers is what an empty store would answer:
 `DestroyCollection` answers False, since nothing existed. It still refuses an
 invalid collection name, as a real store would.
 
 ### Through a wrapper
 
-| Wrapper | Enumerable | Cullable | Destroyable |
-|---|---|---|---|
-| `TKVPrefixKeysWrapper` | `Keys`: the namespace's keys, prefix removed. `Collections`: passed through unchanged | — | — |
-| `TKVPrefixCollectionsWrapper` | its own collections, prefix removed | — | — |
-| `TKVReadOnlyWrapper` | passed through | **refused** | **refused** |
-| `TKVThreadSafeWrapper` | the store's, guarded | the store's, guarded | the store's, guarded |
-| logging, statistics, TTL clamp, fallback | — | — | — |
+| Wrapper | Enumerable | Cullable | Destroyable | Watchable |
+|---|---|---|---|---|
+| `TKVPrefixKeysWrapper` | `Keys`: the namespace's keys, prefix removed. `Collections`: passed through unchanged | — | — | the namespace's keys, prefix removed |
+| `TKVPrefixCollectionsWrapper` | its own collections, prefix removed | — | — | its own collection |
+| `TKVReadOnlyWrapper` | passed through | **refused** | **refused** | passed through |
+| `TKVThreadSafeWrapper` | the store's, guarded | the store's, guarded | the store's, guarded | the store's, guarded |
+| logging, statistics, TTL clamp, fallback, near cache | — | — | — | — |
 
 Details that matter:
 
@@ -262,7 +328,9 @@ Details that matter:
   `IKeyValueDestroyable` only to refuse them. `Supports` answers True, and the
   call raises `EKVReadOnlyError`, or does nothing in `Ignore` mode. It does
   this on purpose: forwarding would let read-only code empty the store.
-- The thread-safe wrapper implements all three so that a capability call is
+- The read-only wrapper passes the watch through: watching is not writing, and
+  a reader is exactly who needs to hear about other people's writes.
+- The thread-safe wrapper implements all four so that a capability call is
   serialized like any other. When the store underneath does not have one, the
   call raises `EKVStoreError`, so `Supports` on this wrapper is optimistic
   too.

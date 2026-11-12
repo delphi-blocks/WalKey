@@ -104,6 +104,28 @@ type
     function CreateStore(const AClock: TKVClock): IKeyValue; override;
   end;
 
+  /// <summary>
+  ///   A cache must be invisible, expiry included. MaxAge is set far beyond
+  ///   anything the suite advances the clock by, so every expiry test is
+  ///   answered by the cache's own judgement rather than by a trip to the
+  ///   store.
+  /// </summary>
+  [TestFixture]
+  TKVNearCacheWrapperConformanceTests = class(TKVConformanceTests)
+  protected
+    function CreateStore(const AClock: TKVClock): IKeyValue; override;
+  end;
+
+  /// <summary>
+  ///   The near cache where it is meant to sit: over a renaming wrapper that
+  ///   reports changes, under the ones that do not.
+  /// </summary>
+  [TestFixture]
+  TKVNearCacheStackConformanceTests = class(TKVConformanceTests)
+  protected
+    function CreateStore(const AClock: TKVClock): IKeyValue; override;
+  end;
+
 implementation
 
 { TKVStatisticsWrapperConformanceTests }
@@ -164,6 +186,27 @@ begin
   Result := TKVThreadSafeWrapper.Create(TKVMemoryStore.Create(AClock));
 end;
 
+{ TKVNearCacheWrapperConformanceTests }
+
+function TKVNearCacheWrapperConformanceTests.CreateStore(const AClock: TKVClock): IKeyValue;
+begin
+  Result := TKVNearCacheWrapper.Create(TKVMemoryStore.Create(AClock), 365 * SecsPerDay, 10000, AClock);
+end;
+
+{ TKVNearCacheStackConformanceTests }
+
+function TKVNearCacheStackConformanceTests.CreateStore(const AClock: TKVClock): IKeyValue;
+begin
+  Result :=
+    TKVLoggingWrapper.Create(
+      TKVStatisticsWrapper.Create(
+        TKVNearCacheWrapper.Create(
+          TKVThreadSafeWrapper.Create(
+            TKVPrefixCollectionsWrapper.Create(
+              TKVMemoryStore.Create(AClock), 'app1')),
+          60, 3, AClock)), nil);
+end;
+
 initialization
   TDUnitX.RegisterTestFixture(TKVStatisticsWrapperConformanceTests);
   TDUnitX.RegisterTestFixture(TKVLoggingWrapperConformanceTests);
@@ -172,5 +215,7 @@ initialization
   TDUnitX.RegisterTestFixture(TKVFallbackWrapperConformanceTests);
   TDUnitX.RegisterTestFixture(TKVWrapperStackConformanceTests);
   TDUnitX.RegisterTestFixture(TKVThreadSafeWrapperConformanceTests);
+  TDUnitX.RegisterTestFixture(TKVNearCacheWrapperConformanceTests);
+  TDUnitX.RegisterTestFixture(TKVNearCacheStackConformanceTests);
 
 end.

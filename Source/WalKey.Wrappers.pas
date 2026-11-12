@@ -25,13 +25,13 @@
 ///
 ///   One rule worth knowing: a wrapper does not pass on the optional
 ///   capabilities (IKeyValueEnumerable, IKeyValueCullable,
-///   IKeyValueDestroyable) of the store it holds. Whether passing one on is
+///   IKeyValueDestroyable, IKeyValueWatchable) of the store it holds. Whether passing one on is
 ///   even safe depends on the wrapper - a read-only wrapper must not hand out
 ///   a DestroyAll, and a prefixing one must not hand out an enumeration that
 ///   reports keys under names its callers never used. So a wrapper offers a
 ///   capability only where it can honour it properly, and everything else is
 ///   reached through the Inner property. The thread-safe wrapper is the one
-///   that always implements all three, so a capability call is guarded like
+///   that always implements all four, so a capability call is guarded like
 ///   any other; a store that has none makes the call raise.
 /// </summary>
 unit WalKey.Wrappers;
@@ -40,6 +40,7 @@ interface
 
 uses
   System.SysUtils, System.SyncObjs, System.Generics.Collections,
+  System.Generics.Defaults,
   WalKey.Core;
 
 type
@@ -89,7 +90,7 @@ type
   ///   must fit too, which is what makes a very long key fail here and pass
   ///   against a bare store.
   /// </summary>
-  TKVPrefixKeysWrapper = class(TKVWrapper, IKeyValueEnumerable)
+  TKVPrefixKeysWrapper = class(TKVWrapper, IKeyValueEnumerable, IKeyValueWatchable)
   private
     FPrefix: string;
     FSeparator: string;
@@ -128,6 +129,14 @@ type
     ///   namespaces keys, not collections.
     /// </summary>
     function Collections: TArray<string>;
+
+    /// <summary>
+    ///   Changes to the namespace's own keys, with the prefix taken back off.
+    ///   Changes to other namespaces' keys are not reported.
+    /// </summary>
+    /// <param name="ACollection">The collection to watch; '' is the default one</param>
+    /// <param name="AOnChange">Called once per change; nil is refused</param>
+    function Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
   end;
 
   /// <summary>
@@ -136,7 +145,7 @@ type
   ///   level up, and the cheaper one when a whole store is to be partitioned,
   ///   since it leaves keys untouched.
   /// </summary>
-  TKVPrefixCollectionsWrapper = class(TKVWrapper, IKeyValueEnumerable)
+  TKVPrefixCollectionsWrapper = class(TKVWrapper, IKeyValueEnumerable, IKeyValueWatchable)
   private
     FPrefix: string;
     FSeparator: string;
@@ -177,6 +186,13 @@ type
     function Collections: TArray<string>;
 
     /// <summary>
+    ///   Changes to one of this namespace's collections.
+    /// </summary>
+    /// <param name="ACollection">The collection to watch; '' is the default one</param>
+    /// <param name="AOnChange">Called once per change; nil is refused</param>
+    function Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+
+    /// <summary>
     ///   The collection a call naming none lands in, before the prefix.
     ///   Defaults to KV_DEFAULT_COLLECTION; set it to match a store whose own
     ///   DefaultCollection is something else, so '' means the same place
@@ -214,7 +230,7 @@ type
   ///   underneath. Enumeration is not a write, so IKeyValueEnumerable passes
   ///   through unchanged.
   /// </summary>
-  TKVReadOnlyWrapper = class(TKVWrapper, IKeyValueEnumerable, IKeyValueCullable, IKeyValueDestroyable)
+  TKVReadOnlyWrapper = class(TKVWrapper, IKeyValueEnumerable, IKeyValueCullable, IKeyValueDestroyable, IKeyValueWatchable)
   private
     FMode: TKVReadOnlyMode;
     procedure Refused(const AOperation: string);
@@ -257,6 +273,14 @@ type
     ///   The collections of the store underneath.
     /// </summary>
     function Collections: TArray<string>;
+
+    /// <summary>
+    ///   Passed through: watching writes is not writing, and a reader is the
+    ///   one that needs to know when somebody else wrote.
+    /// </summary>
+    /// <param name="ACollection">The collection to watch; '' is the default one</param>
+    /// <param name="AOnChange">Called once per change; nil is refused</param>
+    function Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
 
     /// <summary>
     ///   Whether a write raises or is quietly dropped.
@@ -526,7 +550,7 @@ type
   ///   method calls Inner directly rather than a sibling, so a call never
   ///   nests its own lock.
   ///
-  ///   It always implements the three optional capabilities, so a call through
+  ///   It always implements the four optional capabilities, so a call through
   ///   one is guarded like any other rather than reaching the store around the
   ///   lock. If the store underneath does not have that capability, the call
   ///   raises EKVStoreError; Supports is therefore optimistic, exactly as it
@@ -535,7 +559,8 @@ type
   TKVThreadSafeWrapper = class(TKVWrapper,
     IKeyValueEnumerable,
     IKeyValueCullable,
-    IKeyValueDestroyable)
+    IKeyValueDestroyable,
+    IKeyValueWatchable)
   private
     FLock: TCriticalSection;
   public
@@ -563,6 +588,168 @@ type
     function Cull: Integer;
     function DestroyCollection(const AName: string): Boolean;
     procedure DestroyAll;
+    function Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+  end;
+
+  /// <summary>
+  ///   Keeps a local copy of what is read, and drops it the moment the store
+  ///   reports a change - so a read is served from memory, without a round
+  ///   trip, and still sees a write made by any other process.
+  ///
+  ///   It is the cache for a store that several instances share: each keeps
+  ///   the values it reads close at hand, and the store tells all of them when
+  ///   one changes. The store underneath must report changes - support
+  ///   IKeyValueWatchable - or the constructor refuses it. TKVMemoryStore and
+  ///   TKVNatsStore do, and so do the prefixing, read-only and thread-safe
+  ///   wrappers over one of them.
+  ///
+  ///   Put it directly over the store, or over wrappers that report changes,
+  ///   and the rest - logging, statistics, TTL policy, fallback - above it.
+  ///   Logging above it then logs what reached the cache, not the store.
+  /// </summary>
+  /// <remarks>
+  ///   <para>
+  ///     How fresh a value is: a change made through this wrapper is visible
+  ///     to its next read. One made elsewhere is visible once the store has
+  ///     reported it - at once for the memory store, a few milliseconds later
+  ///     for NATS.
+  ///   </para>
+  ///   <para>
+  ///     A store cannot always report everything: a NATS connection that drops
+  ///     and comes back between two reads, or a bucket deleted from outside,
+  ///     goes unnoticed. MaxAge bounds that: nothing is served from the cache
+  ///     once it has been held for longer. It cannot be switched off, since
+  ///     without it a missed change would be served for ever.
+  ///   </para>
+  ///   <para>
+  ///     A value is cached with its expiry and judged against this wrapper's
+  ///     clock, so it expires here when it would have expired in the store.
+  ///     Misses are not cached. Each read is cached on its own, so GetMany
+  ///     reads its misses one at a time.
+  ///   </para>
+  ///   <para>
+  ///     A read never caches a value a change may have overtaken: if anything
+  ///     is reported while a read is out at the store, what it brings back is
+  ///     returned but not kept. Under a steady stream of writes that means
+  ///     fewer values cached, never a stale one.
+  ///   </para>
+  ///   <para>
+  ///     Thread-safe, and the lock is never held while the store is called.
+  ///     The optional capabilities are not offered; reach them through Inner,
+  ///     and call Clear after changing the store in a way it does not report.
+  ///   </para>
+  /// </remarks>
+  TKVNearCacheWrapper = class(TKVWrapper)
+  private type
+    TCached = record
+      Entry: TKVEntry;
+      CachedAt: TDateTime;
+      LastUsed: Int64;
+    end;
+
+    /// <summary>
+    ///   What a watch handler reaches. Reference-counted on its own, so a
+    ///   change reported while the wrapper is being destroyed still lands on
+    ///   something that exists.
+    /// </summary>
+    TState = class(TInterfacedObject)
+    private
+      FLock: TCriticalSection;
+      FEntries: TDictionary<string, TCached>;
+      FWatches: TDictionary<string, IKVWatch>;
+      { Moves on every change. A read that sees it move while it is out at
+        the store does not keep what it brings back. }
+      FGeneration: Int64;
+      FUseClock: Int64;
+      /// <summary>
+      ///   Drops every cached entry of a collection. The caller holds the lock.
+      /// </summary>
+      procedure DropCollection(const ACollection: string);
+    public
+      constructor Create;
+      destructor Destroy; override;
+      /// <summary>
+      ///   A change: drops the key, or the whole collection for ''.
+      /// </summary>
+      procedure Invalidate(const ACollection, AKey: string);
+    end;
+  private
+    FState: TState;
+    FStateRef: IInterface;
+    FWatchable: IKeyValueWatchable;
+    { Serializes starting a watch, which can be a round trip, so two readers
+      of a new collection do not start two. A handler never takes it. }
+    FWatchLock: TCriticalSection;
+    FMaxAge: TKVDuration;
+    FMaxEntries: Integer;
+    FClock: TKVClock;
+    function UtcNow: TDateTime;
+    /// <summary>
+    ///   Makes sure a live watch covers the collection, starting one if need
+    ///   be. False when it cannot be watched, and so must not be cached.
+    /// </summary>
+    function EnsureWatch(const ACollection: string): Boolean;
+    /// <summary>
+    ///   Keeps what a read brought back, unless a change was reported since
+    ///   AGeneration was taken.
+    /// </summary>
+    procedure Keep(const ACollection, AKey: string; const AEntry: TKVEntry;
+      const AGeneration: Int64; const ANow: TDateTime);
+    /// <summary>
+    ///   Makes room: drops the least recently read tenth. The caller holds
+    ///   the lock.
+    /// </summary>
+    procedure Evict;
+  public
+    /// <summary>
+    ///   Puts a cache in front of a store that reports its changes.
+    /// </summary>
+    /// <param name="AInner">The store to cache; it must support IKeyValueWatchable</param>
+    /// <param name="AMaxAge">
+    ///   Seconds an entry is trusted for at most, whatever the store reports.
+    ///   More than 0
+    /// </param>
+    /// <param name="AMaxEntries">
+    ///   How many entries are kept; past that, the least recently read go. At
+    ///   least 1
+    /// </param>
+    /// <param name="AClock">
+    ///   Where "now" is read from, for MaxAge and expiry. Nil for the wall
+    ///   clock; pass the store's own when it was given one
+    /// </param>
+    constructor Create(const AInner: IKeyValue; const AMaxAge: TKVDuration = 60;
+      const AMaxEntries: Integer = 10000; const AClock: TKVClock = nil); reintroduce;
+    destructor Destroy; override;
+
+    function Get(const AKey: string; const ACollection: string = ''): string; override;
+    function TryGet(const AKey, ACollection: string; out AValue: string): Boolean; overload; override;
+    function TryGetEntry(const AKey, ACollection: string; out AEntry: TKVEntry): Boolean; override;
+    function Exists(const AKey: string; const ACollection: string = ''): Boolean; override;
+    procedure Put(const AKey, AValue: string; const ACollection: string = ''; const ATTL: TKVDuration = KV_NO_TTL); override;
+    function Delete(const AKey: string; const ACollection: string = ''): Boolean; override;
+
+    function GetMany(const AKeys: TArray<string>; const ACollection: string = ''): TArray<string>; override;
+    procedure PutMany(const AKeys, AValues: TArray<string>; const ACollection: string = ''; const ATTL: TKVDuration = KV_NO_TTL); override;
+    function DeleteMany(const AKeys: TArray<string>; const ACollection: string = ''): Integer; override;
+
+    /// <summary>
+    ///   Drops everything cached; the next read of each key goes to the store.
+    /// </summary>
+    procedure Clear;
+
+    /// <summary>
+    ///   Entries cached right now, stale ones included until next read.
+    /// </summary>
+    function Count: Integer;
+
+    /// <summary>
+    ///   Seconds an entry is trusted for at most.
+    /// </summary>
+    property MaxAge: TKVDuration read FMaxAge;
+    /// <summary>
+    ///   How many entries are kept at most.
+    /// </summary>
+    property MaxEntries: Integer read FMaxEntries;
   end;
 
 implementation
@@ -574,6 +761,11 @@ resourcestring
   SKVEmptySeparator = 'A prefix separator cannot be empty';
   SKVAmbiguousPrefix = 'A prefix cannot end with its own separator';
   SKVReadOnly = 'This store is read-only: %s is not allowed';
+  SKVNoChangeHandler = 'A watch needs a handler to report changes to';
+  SKVCannotWatch = 'The store underneath cannot report changes';
+  SKVNearCacheNotWatchable = 'A near cache needs a store that reports its changes (IKeyValueWatchable), or it would serve stale values';
+  SKVNearCacheMaxAge = 'A near cache needs a MaxAge of more than 0 seconds';
+  SKVNearCacheMaxEntries = 'A near cache needs room for at least one entry';
 
 { TKVWrapper }
 
@@ -791,6 +983,30 @@ begin
   Result := LEnumerable.Collections;
 end;
 
+function TKVPrefixKeysWrapper.Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+var
+  LWatchable: IKeyValueWatchable;
+  LPrefix: string;
+  LOnChange: TKVChangeProc;
+begin
+  if not Supports(Inner, IKeyValueWatchable, LWatchable) then
+    raise EKVStoreError.Create(SKVCannotWatch);
+  // Checked here, since what the store is handed is never nil.
+  if not Assigned(AOnChange) then
+    raise EKVArgumentError.Create(SKVNoChangeHandler);
+
+  LPrefix := Prefix;
+  LOnChange := AOnChange;
+  Result := LWatchable.Watch(ACollection,
+    procedure (const AKey: string)
+    begin
+      if AKey = '' then
+        LOnChange('')
+      else if AKey.StartsWith(LPrefix) then
+        LOnChange(AKey.Substring(Length(LPrefix)));
+    end);
+end;
+
 { TKVPrefixCollectionsWrapper }
 
 constructor TKVPrefixCollectionsWrapper.Create(const AInner: IKeyValue;
@@ -928,6 +1144,16 @@ begin
   SetLength(Result, LCount);
 end;
 
+function TKVPrefixCollectionsWrapper.Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+var
+  LWatchable: IKeyValueWatchable;
+begin
+  if not Supports(Inner, IKeyValueWatchable, LWatchable) then
+    raise EKVStoreError.Create(SKVCannotWatch);
+
+  Result := LWatchable.Watch(Prefixed(ACollection), AOnChange);
+end;
+
 { TKVReadOnlyWrapper }
 
 constructor TKVReadOnlyWrapper.Create(const AInner: IKeyValue; const AMode: TKVReadOnlyMode);
@@ -1006,6 +1232,16 @@ begin
     raise EKVStoreError.Create('The store underneath cannot enumerate its collections');
 
   Result := LEnumerable.Collections;
+end;
+
+function TKVReadOnlyWrapper.Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+var
+  LWatchable: IKeyValueWatchable;
+begin
+  if not Supports(Inner, IKeyValueWatchable, LWatchable) then
+    raise EKVStoreError.Create(SKVCannotWatch);
+
+  Result := LWatchable.Watch(ACollection, AOnChange);
 end;
 
 { TKVTTLClampWrapper }
@@ -1621,6 +1857,413 @@ begin
     LDestroyable.DestroyAll;
   finally
     FLock.Leave;
+  end;
+end;
+
+function TKVThreadSafeWrapper.Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+var
+  LWatchable: IKeyValueWatchable;
+begin
+  // Starting the watch is guarded like any call. What it reports is not a
+  // call into the store, so the handler is passed on as it is.
+  FLock.Enter;
+  try
+    if not Supports(Inner, IKeyValueWatchable, LWatchable) then
+      raise EKVStoreError.Create(SKVCannotWatch);
+
+    Result := LWatchable.Watch(ACollection, AOnChange);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+{ TKVNearCacheWrapper.TState }
+
+function CacheKeyOf(const ACollection, AKey: string): string;
+begin
+  // Neither a key nor a collection may hold a control character, so #0 cannot
+  // turn two different pairs into one cache key.
+  Result := ACollection + #0 + AKey;
+end;
+
+constructor TKVNearCacheWrapper.TState.Create;
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FEntries := TDictionary<string, TCached>.Create;
+  FWatches := TDictionary<string, IKVWatch>.Create;
+end;
+
+destructor TKVNearCacheWrapper.TState.Destroy;
+begin
+  FWatches.Free;
+  FEntries.Free;
+  FLock.Free;
+  inherited;
+end;
+
+procedure TKVNearCacheWrapper.TState.DropCollection(const ACollection: string);
+var
+  LHead: string;
+  LKey: string;
+begin
+  LHead := CacheKeyOf(ACollection, '');
+  for LKey in FEntries.Keys.ToArray do
+    if LKey.StartsWith(LHead) then
+      FEntries.Remove(LKey);
+end;
+
+procedure TKVNearCacheWrapper.TState.Invalidate(const ACollection, AKey: string);
+begin
+  FLock.Enter;
+  try
+    Inc(FGeneration);
+    if AKey = '' then
+      DropCollection(ACollection)
+    else
+      FEntries.Remove(CacheKeyOf(ACollection, AKey));
+  finally
+    FLock.Leave;
+  end;
+end;
+
+{ TKVNearCacheWrapper }
+
+constructor TKVNearCacheWrapper.Create(const AInner: IKeyValue;
+  const AMaxAge: TKVDuration; const AMaxEntries: Integer; const AClock: TKVClock);
+begin
+  inherited Create(AInner);
+  if not Supports(AInner, IKeyValueWatchable, FWatchable) then
+    raise EKVArgumentError.Create(SKVNearCacheNotWatchable);
+  if not (AMaxAge > 0) then
+    raise EKVArgumentError.Create(SKVNearCacheMaxAge);
+  if AMaxEntries < 1 then
+    raise EKVArgumentError.Create(SKVNearCacheMaxEntries);
+
+  FMaxAge := AMaxAge;
+  FMaxEntries := AMaxEntries;
+  FClock := AClock;
+  FState := TState.Create;
+  FStateRef := FState;
+  FWatchLock := TCriticalSection.Create;
+end;
+
+destructor TKVNearCacheWrapper.Destroy;
+var
+  LWatches: TArray<IKVWatch>;
+begin
+  // Each watch holds a handler that holds the state, so the watches have to
+  // be let go of here or the state would never be freed. They are released
+  // outside the lock: releasing one can call into the store, and the store
+  // may at that moment be calling a handler that wants the lock.
+  if Assigned(FState) then
+  begin
+    FState.FLock.Enter;
+    try
+      LWatches := FState.FWatches.Values.ToArray;
+      FState.FWatches.Clear;
+    finally
+      FState.FLock.Leave;
+    end;
+    LWatches := nil;
+  end;
+
+  FWatchLock.Free;
+  FWatchable := nil;
+  FStateRef := nil;
+  inherited;
+end;
+
+function TKVNearCacheWrapper.UtcNow: TDateTime;
+begin
+  if Assigned(FClock) then
+    Result := FClock()
+  else
+    Result := TKVUtils.UtcNow;
+end;
+
+function TKVNearCacheWrapper.EnsureWatch(const ACollection: string): Boolean;
+var
+  LWatch: IKVWatch;
+  LStateRef: IInterface;
+  LState: TState;
+  LCollection: string;
+begin
+  FState.FLock.Enter;
+  try
+    if FState.FWatches.TryGetValue(ACollection, LWatch) and LWatch.IsLive then
+      Exit(True);
+  finally
+    FState.FLock.Leave;
+  end;
+
+  FWatchLock.Enter;
+  try
+    FState.FLock.Enter;
+    try
+      // Another reader may have started it while this one waited.
+      if FState.FWatches.TryGetValue(ACollection, LWatch) then
+      begin
+        if LWatch.IsLive then
+          Exit(True);
+
+        // A watch that stopped reporting may have missed changes, so nothing
+        // it was vouching for can be trusted any more.
+        FState.FWatches.Remove(ACollection);
+        Inc(FState.FGeneration);
+        FState.DropCollection(ACollection);
+      end;
+    finally
+      FState.FLock.Leave;
+    end;
+    // Released outside the state lock, for the reason the destructor gives.
+    LWatch := nil;
+
+    LState := FState;
+    LStateRef := FStateRef;
+    LCollection := ACollection;
+    try
+      LWatch := FWatchable.Watch(ACollection,
+        procedure (const AKey: string)
+        begin
+          // Naming LStateRef here is what captures it, and keeps the state
+          // alive for as long as the watch can call.
+          if Assigned(LStateRef) then
+            LState.Invalidate(LCollection, AKey);
+        end);
+    except
+      // The store cannot watch just now - the connection is down, say. The
+      // read goes on uncached, and fails on its own if the store is down too.
+      on EKVStoreError do
+        Exit(False);
+    end;
+
+    if not LWatch.IsLive then
+      Exit(False);
+
+    FState.FLock.Enter;
+    try
+      FState.FWatches.AddOrSetValue(ACollection, LWatch);
+    finally
+      FState.FLock.Leave;
+    end;
+    Result := True;
+  finally
+    FWatchLock.Leave;
+  end;
+end;
+
+procedure TKVNearCacheWrapper.Evict;
+var
+  LAll: TArray<TPair<string, TCached>>;
+  LCount: Integer;
+  I: Integer;
+begin
+  // Rare enough to pay for a sort: a tenth goes at once, so the next tenth of
+  // the inserts find room without coming back here.
+  LAll := FState.FEntries.ToArray;
+  TArray.Sort<TPair<string, TCached>>(LAll,
+    TComparer<TPair<string, TCached>>.Construct(
+      function (const ALeft, ARight: TPair<string, TCached>): Integer
+      begin
+        if ALeft.Value.LastUsed < ARight.Value.LastUsed then
+          Result := -1
+        else if ALeft.Value.LastUsed > ARight.Value.LastUsed then
+          Result := 1
+        else
+          Result := 0;
+      end));
+
+  LCount := FMaxEntries div 10;
+  if LCount < 1 then
+    LCount := 1;
+  if LCount > Length(LAll) then
+    LCount := Length(LAll);
+
+  for I := 0 to LCount - 1 do
+    FState.FEntries.Remove(LAll[I].Key);
+end;
+
+procedure TKVNearCacheWrapper.Keep(const ACollection, AKey: string;
+  const AEntry: TKVEntry; const AGeneration: Int64; const ANow: TDateTime);
+var
+  LCached: TCached;
+  LWatch: IKVWatch;
+  LCacheKey: string;
+begin
+  FState.FLock.Enter;
+  try
+    if FState.FGeneration <> AGeneration then
+      Exit;
+    if not (FState.FWatches.TryGetValue(ACollection, LWatch) and LWatch.IsLive) then
+      Exit;
+
+    LCacheKey := CacheKeyOf(ACollection, AKey);
+    if not FState.FEntries.ContainsKey(LCacheKey) and
+       (FState.FEntries.Count >= FMaxEntries) then
+      Evict;
+
+    Inc(FState.FUseClock);
+    LCached.Entry := AEntry;
+    LCached.CachedAt := ANow;
+    LCached.LastUsed := FState.FUseClock;
+    FState.FEntries.AddOrSetValue(LCacheKey, LCached);
+  finally
+    FState.FLock.Leave;
+  end;
+end;
+
+function TKVNearCacheWrapper.TryGetEntry(const AKey, ACollection: string; out AEntry: TKVEntry): Boolean;
+var
+  LCacheKey: string;
+  LCached: TCached;
+  LWatch: IKVWatch;
+  LNow: TDateTime;
+  LGeneration: Int64;
+begin
+  AEntry := Default(TKVEntry);
+  LCacheKey := CacheKeyOf(ACollection, AKey);
+  LNow := UtcNow;
+
+  FState.FLock.Enter;
+  try
+    if FState.FEntries.TryGetValue(LCacheKey, LCached) then
+    begin
+      if (LNow < LCached.CachedAt + FMaxAge / SecsPerDay) and
+         FState.FWatches.TryGetValue(ACollection, LWatch) and LWatch.IsLive then
+      begin
+        // Nothing has changed it since it was read, or the store would have
+        // said so - and if it has expired here, it has expired there too.
+        if LCached.Entry.IsExpiredAt(LNow) then
+        begin
+          FState.FEntries.Remove(LCacheKey);
+          Exit(False);
+        end;
+
+        Inc(FState.FUseClock);
+        LCached.LastUsed := FState.FUseClock;
+        FState.FEntries[LCacheKey] := LCached;
+        AEntry := LCached.Entry;
+        Exit(True);
+      end;
+
+      FState.FEntries.Remove(LCacheKey);
+    end;
+  finally
+    FState.FLock.Leave;
+  end;
+
+  if not EnsureWatch(ACollection) then
+    Exit(Inner.TryGetEntry(AKey, ACollection, AEntry));
+
+  // Taken once the watch is up and before the store is asked: a change
+  // reported from here on means the answer may already be out of date.
+  FState.FLock.Enter;
+  try
+    LGeneration := FState.FGeneration;
+  finally
+    FState.FLock.Leave;
+  end;
+
+  Result := Inner.TryGetEntry(AKey, ACollection, AEntry);
+  if Result then
+    Keep(ACollection, AKey, AEntry, LGeneration, LNow);
+end;
+
+function TKVNearCacheWrapper.Get(const AKey, ACollection: string): string;
+begin
+  if not TryGet(AKey, ACollection, Result) then
+    Result := '';
+end;
+
+function TKVNearCacheWrapper.TryGet(const AKey, ACollection: string; out AValue: string): Boolean;
+var
+  LEntry: TKVEntry;
+begin
+  Result := TryGetEntry(AKey, ACollection, LEntry);
+  AValue := LEntry.Value;
+end;
+
+function TKVNearCacheWrapper.Exists(const AKey, ACollection: string): Boolean;
+var
+  LEntry: TKVEntry;
+begin
+  Result := TryGetEntry(AKey, ACollection, LEntry);
+end;
+
+function TKVNearCacheWrapper.GetMany(const AKeys: TArray<string>; const ACollection: string): TArray<string>;
+var
+  I: Integer;
+begin
+  SetLength(Result, Length(AKeys));
+  for I := 0 to High(AKeys) do
+    Result[I] := Get(AKeys[I], ACollection);
+end;
+
+procedure TKVNearCacheWrapper.Put(const AKey, AValue, ACollection: string; const ATTL: TKVDuration);
+begin
+  // Dropped after the write, whether it succeeded or not: a write that failed
+  // may still have landed. A read racing it either has its value dropped
+  // here, or sees the generation move and keeps nothing.
+  try
+    Inner.Put(AKey, AValue, ACollection, ATTL);
+  finally
+    FState.Invalidate(ACollection, AKey);
+  end;
+end;
+
+function TKVNearCacheWrapper.Delete(const AKey, ACollection: string): Boolean;
+begin
+  try
+    Result := Inner.Delete(AKey, ACollection);
+  finally
+    FState.Invalidate(ACollection, AKey);
+  end;
+end;
+
+procedure TKVNearCacheWrapper.PutMany(const AKeys, AValues: TArray<string>; const ACollection: string; const ATTL: TKVDuration);
+var
+  LKey: string;
+begin
+  TKVUtils.CheckBulkLengths(AKeys, AValues);
+  try
+    Inner.PutMany(AKeys, AValues, ACollection, ATTL);
+  finally
+    for LKey in AKeys do
+      FState.Invalidate(ACollection, LKey);
+  end;
+end;
+
+function TKVNearCacheWrapper.DeleteMany(const AKeys: TArray<string>; const ACollection: string): Integer;
+var
+  LKey: string;
+begin
+  try
+    Result := Inner.DeleteMany(AKeys, ACollection);
+  finally
+    for LKey in AKeys do
+      FState.Invalidate(ACollection, LKey);
+  end;
+end;
+
+procedure TKVNearCacheWrapper.Clear;
+begin
+  FState.FLock.Enter;
+  try
+    Inc(FState.FGeneration);
+    FState.FEntries.Clear;
+  finally
+    FState.FLock.Leave;
+  end;
+end;
+
+function TKVNearCacheWrapper.Count: Integer;
+begin
+  FState.FLock.Enter;
+  try
+    Result := FState.FEntries.Count;
+  finally
+    FState.FLock.Leave;
   end;
 end;
 

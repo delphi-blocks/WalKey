@@ -44,7 +44,8 @@ removal cannot disagree — `TKVMemoryStore` does that too.
 ## TKVMemoryStore
 
 A dictionary of collections, each a dictionary of entries, behind one
-`TCriticalSection`. Thread-safe. Offers all three optional capabilities.
+`TCriticalSection`. Thread-safe. Offers all four optional capabilities; a
+watch is told synchronously, on the writer's thread.
 
 ```pascal
 LStore := TKVMemoryStore.Create;
@@ -193,9 +194,12 @@ the store is built, because every bucket it touches has to agree.
 
 ### What it costs
 
-Every call is a round trip to the server; no value is cached locally. `Keys`
+Every call is a round trip to the server; no value is cached locally by the store itself. `Keys`
 reads every value in the collection, because an expired entry must not be
-listed, and `Cull` walks them all. All three optional capabilities are offered.
+listed, and `Cull` walks them all. All four optional capabilities are offered;
+a watch is a JetStream KV watch on the bucket, and the limits that come with
+it are in [capabilities.md](capabilities.md#ikeyvaluewatchable). Put a
+`TKVNearCacheWrapper` over the store to cache reads locally.
 
 ### Failures
 
@@ -225,6 +229,7 @@ found with `Supports`:
 | `IKeyValueEnumerable` | `Keys(collection)`, `Collections` |
 | `IKeyValueCullable` | `Cull` |
 | `IKeyValueDestroyable` | `DestroyCollection(name)`, `DestroyAll` |
+| `IKeyValueWatchable` | `Watch(collection, handler)` |
 
 ```pascal
 var LCullable: IKeyValueCullable;
@@ -232,7 +237,8 @@ if Supports(LStore, IKeyValueCullable, LCullable) then
   LCullable.Cull;
 ```
 
-All three shipped stores offer all three, and so does the NATS store. A future
+Every shipped store offers the first three. The memory and NATS stores also
+watch; the file and null stores do not. A future
 Redis store might offer only
 some — `Keys` over a large keyspace is not something to do casually.
 

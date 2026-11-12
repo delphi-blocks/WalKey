@@ -314,6 +314,64 @@ type
   end;
 
   /// <summary>
+  ///   Told that something in a watched collection changed.
+  /// </summary>
+  /// <param name="AKey">
+  ///   The key that was written or removed, as the caller wrote it. '' means
+  ///   the store cannot say which key: anything in the collection may have
+  ///   changed, the collection itself may be gone.
+  /// </param>
+  /// <remarks>
+  ///   Runs on whatever thread the store found out on - the writer's own, or a
+  ///   network thread - and possibly while the store holds a lock. So it must
+  ///   be quick, it must not raise, and it must not call the store: record
+  ///   what changed and act on it elsewhere.
+  /// </remarks>
+  TKVChangeProc = reference to procedure(const AKey: string);
+
+  /// <summary>
+  ///   A running watch on one collection. Releasing the last reference stops
+  ///   it; nothing is reported after that.
+  /// </summary>
+  IKVWatch = interface
+    ['{6B2A8E14-3C7D-4F59-A0E6-9D1F4B8C2E75}']
+
+    /// <summary>
+    ///   Whether every change is still being reported. False means some may
+    ///   have been missed - the connection under it dropped, say - and it
+    ///   never turns True again: watch anew. It may be False from the start,
+    ///   when the store cannot watch that collection yet.
+    /// </summary>
+    function IsLive: Boolean;
+  end;
+
+  /// <summary>
+  ///   Optional: a store that can report changes to what it holds, whoever
+  ///   made them. Ask for it with Supports(). It is what lets a cache in one
+  ///   process stay correct while other processes write to the store.
+  /// </summary>
+  /// <remarks>
+  ///   What is reported is that a key changed, not what it changed to: a
+  ///   watcher that wants the value reads it, from another thread than the
+  ///   one it was told on. Expiry is not a change - an entry that expires was
+  ///   already carrying the instant it would, so nobody needs telling.
+  /// </remarks>
+  IKeyValueWatchable = interface
+    ['{7C3B9F25-4D8E-4A6A-B1F7-AE2A5C9D3F86}']
+
+    /// <summary>
+    ///   Starts reporting every write and removal in a collection, made
+    ///   through this store or any other way to the same data. Every change
+    ///   made after the call returns is reported, for as long as the watch
+    ///   is held and live. Changes from before it are not.
+    /// </summary>
+    /// <param name="ACollection">The collection to watch; '' is the default one</param>
+    /// <param name="AOnChange">Called once per change; nil is refused</param>
+    /// <returns>The watch; release it to stop</returns>
+    function Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+  end;
+
+  /// <summary>
   ///   The on-the-wire form of a TKVEntry, for stores that persist text.
   ///
   ///   The value is carried as an escaped JSON string rather than nested JSON:

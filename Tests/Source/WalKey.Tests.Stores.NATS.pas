@@ -34,7 +34,7 @@ uses
   Nats.JetStream.Consts, Nats.JetStream.Client, Nats.JetStream.Entities,
   Nats.JetStream.KV,
   { After Nats.JetStream.KV, so the unqualified TKVEntry is WalKey's }
-  WalKey.Core, WalKey.Stores.NATS,
+  WalKey.Core, WalKey.Stores.NATS, WalKey.Wrappers,
   WalKey.Tests.Conformance;
 
 type
@@ -65,6 +65,8 @@ type
     [Test] procedure BareMode_StoresTheValueVerbatim;
     [Test] procedure BareMode_RefusesATtl;
     [Test] procedure Names_ThatTheNatsSideCannotHold_AreEncoded;
+    [Test] procedure Watch_ACollectionWithNoBucket_IsNotLive;
+    [Test] procedure NearCache_SeesAWriteFromAnotherInstance;
   end;
 
 implementation
@@ -205,6 +207,53 @@ begin
   finally
     LStore.Free;
   end;
+end;
+
+procedure TKVNatsStoreTests.Watch_ACollectionWithNoBucket_IsNotLive;
+var
+  LStore: TKVNatsStore;
+  LStoreRef: IKeyValue;
+  LWatch: IKVWatch;
+begin
+  LStore := TKVNatsStore.Create(FJs, FPrefix);
+  LStoreRef := LStore;
+
+  LWatch := LStore.Watch('never-written',
+    procedure (const AKey: string)
+    begin
+    end);
+
+  Assert.IsFalse(LWatch.IsLive, 'there is no bucket to watch yet');
+  Assert.AreEqual(0, Length(LStore.Collections), 'and watching did not create one');
+end;
+
+procedure TKVNatsStoreTests.NearCache_SeesAWriteFromAnotherInstance;
+const
+  VALUE_NEW = '{"user":43}';
+var
+  LWriter, LReader, LCache: IKeyValue;
+  LDeadline: UInt64;
+begin
+  // Two stores over the same buckets stand for two processes: what one
+  // writes reaches the other's cache only through the server's watch.
+  LWriter := TKVNatsStore.Create(FJs, FPrefix);
+  LReader := TKVNatsStore.Create(FJs, FPrefix);
+  LCache := TKVNearCacheWrapper.Create(LReader, 60);
+
+  LWriter.Put('a', VALUE_BARE, 'shared');
+  Assert.AreEqual(VALUE_BARE, LCache.Get('a', 'shared'));
+  Assert.AreEqual(VALUE_BARE, LCache.Get('a', 'shared'));
+
+  LWriter.Put('a', VALUE_NEW, 'shared');
+
+  // The report arrives a moment after the write, on the reader thread. A
+  // live server is the one place this suite has to wait for something.
+  LDeadline := TThread.GetTickCount64 + 5000;
+  while (LCache.Get('a', 'shared') <> VALUE_NEW) and
+        (TThread.GetTickCount64 < LDeadline) do
+    TThread.Sleep(10);
+
+  Assert.AreEqual(VALUE_NEW, LCache.Get('a', 'shared'));
 end;
 
 initialization

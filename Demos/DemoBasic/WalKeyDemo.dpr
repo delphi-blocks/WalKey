@@ -11,7 +11,7 @@
 
 /// <summary>
 ///   A tour of WalKey in one console program: the stores, what TTL does, the
-///   wrappers, and typed access through Neon. Everything it writes goes into
+///   wrappers, a near cache per instance, and typed access through Neon. Everything it writes goes into
 ///   a folder under the system temp directory, which it removes on the way
 ///   out.
 /// </summary>
@@ -205,6 +205,49 @@ begin
   Say('as stored underneath: %s', [string.Join(', ', LMemory.Keys)]);
 end;
 
+{ A near cache in each instance, over one shared store }
+
+procedure ShowNearCache;
+var
+  LShared: IKeyValue;
+  LCacheA, LCacheB: TKVNearCacheWrapper;
+  LInstanceA, LInstanceB: IKeyValue;
+  LBlind: IKeyValue;
+begin
+  Section('A near cache per instance');
+
+  // One store shared by two instances of an application. In production this
+  // is a TKVNatsStore; the memory store reports its changes the same way.
+  LShared := TKVMemoryStore.Create(Clock());
+
+  LCacheA := TKVNearCacheWrapper.Create(LShared, 60, 1000, Clock());
+  LInstanceA := LCacheA;
+  LCacheB := TKVNearCacheWrapper.Create(LShared, 60, 1000, Clock());
+  LInstanceB := LCacheB;
+
+  LShared.Put('jwks', '{"keys":["k1"]}', 'oauth');
+  Say('A reads -> %s', [LInstanceA.Get('jwks', 'oauth')]);
+  Say('B reads -> %s', [LInstanceB.Get('jwks', 'oauth')]);
+  Say('each now answers from its own memory: A holds %d, B holds %d',
+    [LCacheA.Count, LCacheB.Count]);
+
+  // A writes through its cache. The store reports the change, and B drops its
+  // copy without being told by A.
+  LInstanceA.Put('jwks', '{"keys":["k2"]}', 'oauth');
+  Say('A rotates the keys; the store tells B, which now holds %d', [LCacheB.Count]);
+  Say('B reads -> %s', [LInstanceB.Get('jwks', 'oauth')]);
+
+  // A store that cannot report its changes would leave the cache serving
+  // stale values, so the cache refuses it.
+  LBlind := TKVFileTreeStore.Create(TPath.Combine(GRoot, 'blind'), Clock());
+  try
+    TKVNearCacheWrapper.Create(LBlind);
+  except
+    on E: EKVArgumentError do
+      Say('over the file store -> refused: %s', [E.Message]);
+  end;
+end;
+
 { Read-only, and the store that keeps nothing }
 
 procedure ShowReadOnlyAndNull;
@@ -304,6 +347,7 @@ begin
     ShowExpiry;
     ShowTheFileStore;
     ShowWrappers;
+    ShowNearCache;
     ShowReadOnlyAndNull;
     ShowTypedAccess;
     ShowCapabilities;

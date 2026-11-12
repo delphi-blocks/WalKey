@@ -23,7 +23,8 @@ uses
   System.SysUtils, System.Classes, System.SyncObjs, System.Threading,
   System.Generics.Collections,
   DUnitX.TestFramework,
-  WalKey.Core, WalKey.Stores.Memory, WalKey.Stores.Null, WalKey.Wrappers;
+  WalKey.Core, WalKey.Stores.Memory, WalKey.Stores.Null, WalKey.Wrappers,
+  WalKey.Tests.Conformance;
 
 type
   /// <summary>
@@ -68,6 +69,41 @@ type
     constructor Create(const AClock: TKVClock = nil); override;
     destructor Destroy; override;
     property Tripped: Boolean read FTripped;
+  end;
+
+  /// <summary>
+  ///   A memory store that counts the reads reaching it, so a test can tell a
+  ///   value served by a cache from one fetched. AfterRead runs once a read
+  ///   has its answer and before it is returned, which is where a test plants
+  ///   a change that overtakes the read.
+  /// </summary>
+  TKVCountingStore = class(TKVMemoryStore)
+  private
+    FReads: Integer;
+    FAfterRead: TProc<string>;
+  protected
+    function DoTryGet(const ACollection, AKey: string; out AEntry: TKVEntry): Boolean; override;
+  public
+    property Reads: Integer read FReads;
+    property AfterRead: TProc<string> read FAfterRead write FAfterRead;
+  end;
+
+  /// <summary>
+  ///   Watches a memory store, with a switch that makes every watch go dead -
+  ///   reporting nothing and saying so - as a dropped connection does, and
+  ///   another that makes a new watch fail outright.
+  /// </summary>
+  TKVSwitchedWatchStore = class(TKVWrapper, IKeyValueWatchable)
+  private
+    FLive: Boolean;
+    FFailing: Boolean;
+    FWatchesStarted: Integer;
+  public
+    constructor Create(const AInner: IKeyValue); reintroduce;
+    function Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+    property Live: Boolean read FLive write FLive;
+    property Failing: Boolean read FFailing write FFailing;
+    property WatchesStarted: Integer read FWatchesStarted;
   end;
 
   /// <summary>
@@ -221,6 +257,51 @@ type
     [Test] procedure Capabilities_RefuseWhenTheStoreHasNone;
   end;
 
+  /// <summary>
+  ///   Watching through the wrappers that rename: a watcher hears about its
+  ///   own names, never the store's.
+  /// </summary>
+  [TestFixture]
+  TKVWatchThroughWrappersTests = class(TKVWrapperTestCase)
+  public
+    [Test] procedure PrefixKeys_ReportsItsOwnKeysUnprefixed;
+    [Test] procedure PrefixCollections_WatchesTheRenamedCollection;
+    [Test] procedure ReadOnly_PassesTheWatchThrough;
+    [Test] procedure ThreadSafe_RefusesWhenTheStoreCannotWatch;
+  end;
+
+  [TestFixture]
+  TKVNearCacheWrapperTests = class(TKVWrapperTestCase)
+  private
+    FCounting: TKVCountingStore;
+    FCountingRef: IKeyValue;
+    function Clock: TKVClock;
+    /// <summary>
+    ///   A fresh counting store, and a cache over it, both reading the fixture
+    ///   clock. The caller holds the cache by interface.
+    /// </summary>
+    function NewCache(const AMaxAge: TKVDuration = 60;
+      const AMaxEntries: Integer = 100): TKVNearCacheWrapper;
+  public
+    [Test] procedure AStoreThatCannotWatch_IsRefused;
+    [Test] procedure NonsenseLimits_AreRefused;
+    [Test] procedure SecondRead_IsServedLocally;
+    [Test] procedure AMiss_IsNotCached;
+    [Test] procedure AWriteElsewhere_IsSeenAtOnce;
+    [Test] procedure ADeleteElsewhere_IsSeenAtOnce;
+    [Test] procedure ADroppedCollection_IsSeenAtOnce;
+    [Test] procedure AWriteThrough_IsSeenAtOnce;
+    [Test] procedure Expiry_IsJudgedLocally;
+    [Test] procedure MaxAge_BoundsHowLongAnEntryIsTrusted;
+    [Test] procedure MaxEntries_DropsTheLeastRecentlyRead;
+    [Test] procedure AChangeOvertakingARead_IsNotKept;
+    [Test] procedure ADeadWatch_IsNotTrusted;
+    [Test] procedure AWatchThatCannotStart_LeavesReadsUncached;
+    [Test] procedure Clear_DropsEverything;
+    [Test] procedure OverAReadOnlyView_SeesWritesUnderneath;
+    [Test] procedure OverPrefixedKeys_SeesWritesUnderneath;
+  end;
+
 implementation
 
 const
@@ -321,6 +402,79 @@ begin
 end;
 
 { TKVWrapperTestCase }
+
+{ TKVCountingStore }
+
+function TKVCountingStore.DoTryGet(const ACollection, AKey: string;
+  out AEntry: TKVEntry): Boolean;
+begin
+  // After the lock is let go, so AfterRead may write to the store.
+  Result := inherited DoTryGet(ACollection, AKey, AEntry);
+  TInterlocked.Increment(FReads);
+  if Assigned(FAfterRead) then
+    FAfterRead(AKey);
+end;
+
+{ TKVSwitchedWatchStore }
+
+type
+  TKVSwitchedWatch = class(TInterfacedObject, IKVWatch)
+  private
+    FOwner: TKVSwitchedWatchStore;
+    FOwnerRef: IKeyValue;
+    FInner: IKVWatch;
+    FDead: Boolean;
+  public
+    constructor Create(const AOwner: TKVSwitchedWatchStore; const AInner: IKVWatch);
+    function IsLive: Boolean;
+  end;
+
+constructor TKVSwitchedWatch.Create(const AOwner: TKVSwitchedWatchStore;
+  const AInner: IKVWatch);
+begin
+  inherited Create;
+  FOwner := AOwner;
+  FOwnerRef := AOwner;
+  FInner := AInner;
+end;
+
+function TKVSwitchedWatch.IsLive: Boolean;
+begin
+  // Dead once, dead for good - a real watch does not come back either.
+  if not FOwner.Live then
+    FDead := True;
+  Result := not FDead and FInner.IsLive;
+end;
+
+constructor TKVSwitchedWatchStore.Create(const AInner: IKeyValue);
+begin
+  inherited Create(AInner);
+  FLive := True;
+end;
+
+function TKVSwitchedWatchStore.Watch(const ACollection: string;
+  const AOnChange: TKVChangeProc): IKVWatch;
+var
+  LWatchable: IKeyValueWatchable;
+  LOnChange: TKVChangeProc;
+  LSelf: TKVSwitchedWatchStore;
+begin
+  if FFailing then
+    raise EKVStoreError.Create('This watch cannot start');
+  if not Supports(Inner, IKeyValueWatchable, LWatchable) then
+    raise EKVStoreError.Create('The store underneath cannot watch');
+
+  Inc(FWatchesStarted);
+  LOnChange := AOnChange;
+  LSelf := Self;
+  Result := TKVSwitchedWatch.Create(Self, LWatchable.Watch(ACollection,
+    procedure (const AKey: string)
+    begin
+      // Switched off, a change is lost on the way - which is the point.
+      if LSelf.Live then
+        LOnChange(AKey);
+    end));
+end;
 
 procedure TKVWrapperTestCase.Setup;
 begin
@@ -1361,7 +1515,7 @@ var
   LCullable: IKeyValueCullable;
   LDestroyable: IKeyValueDestroyable;
 begin
-  // The wrapper implements all three so a capability call is guarded like any
+  // The wrapper implements all four so a capability call is guarded like any
   // other. Over a store that has none, Supports is optimistic and the call
   // raises - the same bargain the prefix wrappers make.
   LStore := TKVThreadSafeWrapper.Create(TKVFailingStore.Create);
@@ -1387,6 +1541,441 @@ begin
     end, EKVStoreError);
 end;
 
+{ TKVWatchThroughWrappersTests }
+
+procedure TKVWatchThroughWrappersTests.PrefixKeys_ReportsItsOwnKeysUnprefixed;
+var
+  LStore: IKeyValue;
+  LWatchable: IKeyValueWatchable;
+  LLog: TKVChangeLog;
+  LWatch: IKVWatch;
+begin
+  LStore := TKVPrefixKeysWrapper.Create(Inner, 't1');
+  Assert.IsTrue(Supports(LStore, IKeyValueWatchable, LWatchable));
+
+  LLog := TKVChangeLog.Create;
+  try
+    LWatch := LWatchable.Watch('users', LLog.Handler());
+    try
+      Memory.Put('t2:b', VALUE_A, 'users');
+      Memory.Put('t1:a', VALUE_A, 'users');
+
+      Assert.IsTrue(LLog.Contains('a'), 'its own key, without the prefix');
+      Assert.AreEqual(1, LLog.Count, 'another namespace''s key is not reported');
+
+      Memory.DestroyCollection('users');
+      Assert.IsTrue(LLog.Contains(''), '"anything may have changed" is passed on');
+    finally
+      LWatch := nil;
+    end;
+  finally
+    LLog.Free;
+  end;
+end;
+
+procedure TKVWatchThroughWrappersTests.PrefixCollections_WatchesTheRenamedCollection;
+var
+  LStore: IKeyValue;
+  LWatchable: IKeyValueWatchable;
+  LLog: TKVChangeLog;
+  LWatch: IKVWatch;
+begin
+  LStore := TKVPrefixCollectionsWrapper.Create(Inner, 'app1');
+  Assert.IsTrue(Supports(LStore, IKeyValueWatchable, LWatchable));
+
+  LLog := TKVChangeLog.Create;
+  try
+    LWatch := LWatchable.Watch('users', LLog.Handler());
+    try
+      Memory.Put('b', VALUE_A, 'users');
+      Memory.Put('a', VALUE_A, 'app1_users');
+
+      Assert.IsTrue(LLog.Contains('a'));
+      Assert.AreEqual(1, LLog.Count, 'the unprefixed collection is someone else''s');
+    finally
+      LWatch := nil;
+    end;
+  finally
+    LLog.Free;
+  end;
+end;
+
+procedure TKVWatchThroughWrappersTests.ReadOnly_PassesTheWatchThrough;
+var
+  LStore: IKeyValue;
+  LWatchable: IKeyValueWatchable;
+  LLog: TKVChangeLog;
+  LWatch: IKVWatch;
+begin
+  LStore := TKVReadOnlyWrapper.Create(Inner, TKVReadOnlyMode.Refuse);
+  Assert.IsTrue(Supports(LStore, IKeyValueWatchable, LWatchable));
+
+  LLog := TKVChangeLog.Create;
+  try
+    LWatch := LWatchable.Watch('users', LLog.Handler());
+    try
+      Memory.Put('a', VALUE_A, 'users');
+      Assert.IsTrue(LLog.Contains('a'));
+    finally
+      LWatch := nil;
+    end;
+  finally
+    LLog.Free;
+  end;
+end;
+
+procedure TKVWatchThroughWrappersTests.ThreadSafe_RefusesWhenTheStoreCannotWatch;
+var
+  LFailing: IKeyValue;
+  LStore: IKeyValue;
+  LWatchable: IKeyValueWatchable;
+begin
+  LFailing := TKVFailingStore.Create;
+  LStore := TKVThreadSafeWrapper.Create(LFailing);
+
+  // Optimistic, like the other three capabilities it always implements.
+  Assert.IsTrue(Supports(LStore, IKeyValueWatchable, LWatchable));
+  Assert.WillRaise(
+    procedure
+    var
+      LWatch: IKVWatch;
+    begin
+      LWatch := LWatchable.Watch('users',
+        procedure (const AKey: string)
+        begin
+        end);
+    end, EKVStoreError);
+end;
+
+{ TKVNearCacheWrapperTests }
+
+function TKVNearCacheWrapperTests.Clock: TKVClock;
+begin
+  Result :=
+    function: TDateTime
+    begin
+      Result := Self.Now;
+    end;
+end;
+
+function TKVNearCacheWrapperTests.NewCache(const AMaxAge: TKVDuration;
+  const AMaxEntries: Integer): TKVNearCacheWrapper;
+begin
+  FCounting := TKVCountingStore.Create(Clock());
+  FCountingRef := FCounting;
+  Result := TKVNearCacheWrapper.Create(FCountingRef, AMaxAge, AMaxEntries, Clock());
+end;
+
+procedure TKVNearCacheWrapperTests.AStoreThatCannotWatch_IsRefused;
+var
+  LBlind: IKeyValue;
+begin
+  // A statistics wrapper does not pass the watch on, so over it the cache
+  // would never hear of a change.
+  LBlind := TKVStatisticsWrapper.Create(Inner);
+  Assert.WillRaise(
+    procedure
+    var
+      LStore: IKeyValue;
+    begin
+      LStore := TKVNearCacheWrapper.Create(LBlind);
+    end, EKVArgumentError);
+end;
+
+procedure TKVNearCacheWrapperTests.NonsenseLimits_AreRefused;
+begin
+  Assert.WillRaise(
+    procedure
+    var
+      LStore: IKeyValue;
+    begin
+      LStore := TKVNearCacheWrapper.Create(Inner, 0);
+    end, EKVArgumentError, 'a MaxAge of 0 would trust a missed change for ever');
+  Assert.WillRaise(
+    procedure
+    var
+      LStore: IKeyValue;
+    begin
+      LStore := TKVNearCacheWrapper.Create(Inner, -1);
+    end, EKVArgumentError);
+  Assert.WillRaise(
+    procedure
+    var
+      LStore: IKeyValue;
+    begin
+      LStore := TKVNearCacheWrapper.Create(Inner, 60, 0);
+    end, EKVArgumentError);
+end;
+
+procedure TKVNearCacheWrapperTests.SecondRead_IsServedLocally;
+var
+  LCache: IKeyValue;
+begin
+  LCache := NewCache;
+  FCounting.Put('a', VALUE_A, 'users');
+
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+  Assert.IsTrue(LCache.Exists('a', 'users'));
+  Assert.AreEqual(1, FCounting.Reads, 'only the first read reached the store');
+end;
+
+procedure TKVNearCacheWrapperTests.AMiss_IsNotCached;
+var
+  LCache: IKeyValue;
+begin
+  LCache := NewCache;
+
+  Assert.AreEqual('', LCache.Get('nope', 'users'));
+  Assert.AreEqual('', LCache.Get('nope', 'users'));
+  Assert.AreEqual(2, FCounting.Reads);
+end;
+
+procedure TKVNearCacheWrapperTests.AWriteElsewhere_IsSeenAtOnce;
+var
+  LCache: IKeyValue;
+begin
+  LCache := NewCache;
+  FCounting.Put('a', VALUE_A, 'users');
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+
+  // Straight into the store, around the cache: another process, in effect.
+  FCounting.Put('a', VALUE_B, 'users');
+
+  Assert.AreEqual(VALUE_B, LCache.Get('a', 'users'));
+  Assert.AreEqual(2, FCounting.Reads);
+end;
+
+procedure TKVNearCacheWrapperTests.ADeleteElsewhere_IsSeenAtOnce;
+var
+  LCache: IKeyValue;
+begin
+  LCache := NewCache;
+  FCounting.Put('a', VALUE_A, 'users');
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+
+  FCounting.Delete('a', 'users');
+
+  Assert.AreEqual('', LCache.Get('a', 'users'));
+end;
+
+procedure TKVNearCacheWrapperTests.ADroppedCollection_IsSeenAtOnce;
+var
+  LCache: IKeyValue;
+begin
+  LCache := NewCache;
+  FCounting.Put('a', VALUE_A, 'users');
+  FCounting.Put('b', VALUE_B, 'users');
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+  Assert.AreEqual(VALUE_B, LCache.Get('b', 'users'));
+
+  FCounting.DestroyCollection('users');
+
+  Assert.AreEqual('', LCache.Get('a', 'users'));
+  Assert.AreEqual('', LCache.Get('b', 'users'));
+end;
+
+procedure TKVNearCacheWrapperTests.AWriteThrough_IsSeenAtOnce;
+var
+  LCache: IKeyValue;
+begin
+  LCache := NewCache;
+  LCache.Put('a', VALUE_A, 'users');
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+
+  LCache.Put('a', VALUE_B, 'users');
+  Assert.AreEqual(VALUE_B, LCache.Get('a', 'users'));
+
+  LCache.Delete('a', 'users');
+  Assert.AreEqual('', LCache.Get('a', 'users'));
+end;
+
+procedure TKVNearCacheWrapperTests.Expiry_IsJudgedLocally;
+var
+  LCache: IKeyValue;
+begin
+  LCache := NewCache;
+  FCounting.Put('a', VALUE_A, 'users', 30);
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+
+  Advance(31);
+
+  Assert.AreEqual('', LCache.Get('a', 'users'), 'expired here as it has in the store');
+  Assert.AreEqual(1, FCounting.Reads, 'and known without asking the store');
+end;
+
+procedure TKVNearCacheWrapperTests.MaxAge_BoundsHowLongAnEntryIsTrusted;
+var
+  LCache: IKeyValue;
+begin
+  LCache := NewCache(10);
+  FCounting.Put('a', VALUE_A, 'users');
+  LCache.Get('a', 'users');
+
+  Advance(11);
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+  Assert.AreEqual(2, FCounting.Reads, 'held too long, so read again');
+
+  LCache.Get('a', 'users');
+  Assert.AreEqual(2, FCounting.Reads, 'and trusted again from then on');
+end;
+
+procedure TKVNearCacheWrapperTests.MaxEntries_DropsTheLeastRecentlyRead;
+var
+  LNear: TKVNearCacheWrapper;
+  LCache: IKeyValue;
+begin
+  LNear := NewCache(60, 2);
+  LCache := LNear;
+  FCounting.Put('a', VALUE_A, 'users');
+  FCounting.Put('b', VALUE_A, 'users');
+  FCounting.Put('c', VALUE_A, 'users');
+
+  LCache.Get('a', 'users');
+  LCache.Get('b', 'users');
+  LCache.Get('a', 'users');   // a is now more recent than b
+  LCache.Get('c', 'users');   // full: b goes
+  Assert.AreEqual(2, LNear.Count);
+  Assert.AreEqual(3, FCounting.Reads);
+
+  LCache.Get('a', 'users');
+  Assert.AreEqual(3, FCounting.Reads, 'a was kept');
+  LCache.Get('b', 'users');
+  Assert.AreEqual(4, FCounting.Reads, 'b was not');
+end;
+
+procedure TKVNearCacheWrapperTests.AChangeOvertakingARead_IsNotKept;
+var
+  LCache: IKeyValue;
+  LDone: Boolean;
+begin
+  LCache := NewCache;
+  FCounting.Put('a', VALUE_A, 'users');
+
+  // The read has its answer; before it is back, someone else writes.
+  LDone := False;
+  FCounting.AfterRead :=
+    procedure (AKey: string)
+    begin
+      if not LDone then
+      begin
+        LDone := True;
+        FCounting.Put('a', VALUE_B, 'users');
+      end;
+    end;
+
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'), 'the read answers what it read');
+  Assert.AreEqual(VALUE_B, LCache.Get('a', 'users'), 'but did not keep it');
+  FCounting.AfterRead := nil;
+end;
+
+procedure TKVNearCacheWrapperTests.ADeadWatch_IsNotTrusted;
+var
+  LSwitched: TKVSwitchedWatchStore;
+  LSwitchedRef: IKeyValue;
+  LCache: IKeyValue;
+begin
+  FCounting := TKVCountingStore.Create(Clock());
+  FCountingRef := FCounting;
+  LSwitched := TKVSwitchedWatchStore.Create(FCountingRef);
+  LSwitchedRef := LSwitched;
+  LCache := TKVNearCacheWrapper.Create(LSwitchedRef, 60, 100, Clock());
+
+  FCounting.Put('a', VALUE_A, 'users');
+  LCache.Get('a', 'users');
+  LCache.Get('a', 'users');
+  Assert.AreEqual(1, FCounting.Reads);
+
+  // The connection drops, and a change made meanwhile is never reported.
+  LSwitched.Live := False;
+  FCounting.Put('a', VALUE_B, 'users');
+
+  Assert.AreEqual(VALUE_B, LCache.Get('a', 'users'), 'a dead watch vouches for nothing');
+  LCache.Get('a', 'users');
+  Assert.AreEqual(3, FCounting.Reads, 'and nothing is cached until a watch is live again');
+
+  LSwitched.Live := True;
+  LCache.Get('a', 'users');
+  LCache.Get('a', 'users');
+  Assert.AreEqual(4, FCounting.Reads, 'a new watch, and caching resumes');
+  Assert.IsTrue(LSwitched.WatchesStarted >= 2);
+end;
+
+procedure TKVNearCacheWrapperTests.AWatchThatCannotStart_LeavesReadsUncached;
+var
+  LSwitched: TKVSwitchedWatchStore;
+  LSwitchedRef: IKeyValue;
+  LCache: IKeyValue;
+begin
+  FCounting := TKVCountingStore.Create(Clock());
+  FCountingRef := FCounting;
+  LSwitched := TKVSwitchedWatchStore.Create(FCountingRef);
+  LSwitchedRef := LSwitched;
+  LSwitched.Failing := True;
+  LCache := TKVNearCacheWrapper.Create(LSwitchedRef, 60, 100, Clock());
+
+  FCounting.Put('a', VALUE_A, 'users');
+
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'), 'the read still works');
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+  Assert.AreEqual(2, FCounting.Reads, 'but nothing was cached');
+end;
+
+procedure TKVNearCacheWrapperTests.Clear_DropsEverything;
+var
+  LNear: TKVNearCacheWrapper;
+  LCache: IKeyValue;
+begin
+  LNear := NewCache;
+  LCache := LNear;
+  FCounting.Put('a', VALUE_A, 'users');
+  LCache.Get('a', 'users');
+  Assert.AreEqual(1, LNear.Count);
+
+  LNear.Clear;
+
+  Assert.AreEqual(0, LNear.Count);
+  LCache.Get('a', 'users');
+  Assert.AreEqual(2, FCounting.Reads);
+end;
+
+procedure TKVNearCacheWrapperTests.OverAReadOnlyView_SeesWritesUnderneath;
+var
+  LReadOnly: IKeyValue;
+  LCache: IKeyValue;
+begin
+  FCounting := TKVCountingStore.Create(Clock());
+  FCountingRef := FCounting;
+  LReadOnly := TKVReadOnlyWrapper.Create(FCountingRef, TKVReadOnlyMode.Refuse);
+  LCache := TKVNearCacheWrapper.Create(LReadOnly, 60, 100, Clock());
+
+  FCounting.Put('a', VALUE_A, 'users');
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+  FCounting.Put('a', VALUE_B, 'users');
+  Assert.AreEqual(VALUE_B, LCache.Get('a', 'users'));
+end;
+
+procedure TKVNearCacheWrapperTests.OverPrefixedKeys_SeesWritesUnderneath;
+var
+  LPrefixed: IKeyValue;
+  LCache: IKeyValue;
+begin
+  FCounting := TKVCountingStore.Create(Clock());
+  FCountingRef := FCounting;
+  LPrefixed := TKVPrefixKeysWrapper.Create(FCountingRef, 't1');
+  LCache := TKVNearCacheWrapper.Create(LPrefixed, 60, 100, Clock());
+
+  FCounting.Put('t1:a', VALUE_A, 'users');
+  Assert.AreEqual(VALUE_A, LCache.Get('a', 'users'));
+  FCounting.Put('t1:a', VALUE_B, 'users');
+  Assert.AreEqual(VALUE_B, LCache.Get('a', 'users'));
+  Assert.AreEqual(2, FCounting.Reads);
+
+  FCounting.Put('t2:a', VALUE_A, 'users');
+  Assert.AreEqual(VALUE_B, LCache.Get('a', 'users'));
+  Assert.AreEqual(2, FCounting.Reads, 'another namespace''s write leaves this one cached');
+end;
+
 initialization
   TDUnitX.RegisterTestFixture(TKVWrapperBaseTests);
   TDUnitX.RegisterTestFixture(TKVPrefixKeysWrapperTests);
@@ -1397,5 +1986,7 @@ initialization
   TDUnitX.RegisterTestFixture(TKVStatisticsWrapperTests);
   TDUnitX.RegisterTestFixture(TKVFallbackWrapperTests);
   TDUnitX.RegisterTestFixture(TKVThreadSafeWrapperTests);
+  TDUnitX.RegisterTestFixture(TKVWatchThroughWrappersTests);
+  TDUnitX.RegisterTestFixture(TKVNearCacheWrapperTests);
 
 end.

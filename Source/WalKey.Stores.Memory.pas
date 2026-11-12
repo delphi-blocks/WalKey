@@ -29,19 +29,39 @@ uses
   WalKey.Core;
 
 type
+  TKVMemoryWatch = class;
+
   /// <summary>
   ///   Keeps everything in memory, for as long as the instance lives. Keys and
   ///   collection names are case-sensitive, and instances are thread-safe.
+  ///
+  ///   A watch is told synchronously, on the writer's thread and under the
+  ///   store's lock, so by the time a Put returns every watcher already
+  ///   knows.
   /// </summary>
   TKVMemoryStore = class(TKVStoreBase,
     IKeyValueEnumerable,
     IKeyValueCullable,
-    IKeyValueDestroyable)
+    IKeyValueDestroyable,
+    IKeyValueWatchable)
   private type
     TEntries = TDictionary<string, TKVEntry>;
   private
     FLock: TCriticalSection;
     FCollections: TObjectDictionary<string, TEntries>;
+    { Not owned: a watch removes itself when it is released. }
+    FWatches: TList<TKVMemoryWatch>;
+
+    /// <summary>
+    ///   Tells every watch on ACollection - every watch at all, when
+    ///   ACollection is '' - that AKey changed. The caller must hold the lock.
+    /// </summary>
+    procedure Notify(const ACollection, AKey: string);
+
+    /// <summary>
+    ///   Forgets a watch that is being released.
+    /// </summary>
+    procedure RemoveWatch(const AWatch: TKVMemoryWatch);
 
     /// <summary>
     ///   The entries of a collection. The caller must hold the lock.
@@ -136,12 +156,39 @@ type
     procedure DestroyAll;
 
     /// <summary>
+    ///   Reports every write and removal in a collection, synchronously.
+    /// </summary>
+    /// <param name="ACollection">The collection to watch; '' is the default one</param>
+    /// <param name="AOnChange">Called once per change; nil is refused</param>
+    function Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+
+    /// <summary>
     ///   Entries held, expired ones included until they are read or culled.
     /// </summary>
     function Count: Integer;
   end;
 
+  /// <summary>
+  ///   What TKVMemoryStore.Watch returns. It holds the store, so the store
+  ///   outlives every watch on it, and it is always live.
+  /// </summary>
+  TKVMemoryWatch = class(TInterfacedObject, IKVWatch)
+  private
+    FStore: TKVMemoryStore;
+    FStoreRef: IKeyValue;
+    FCollection: string;
+    FOnChange: TKVChangeProc;
+  public
+    constructor Create(const AStore: TKVMemoryStore; const ACollection: string;
+      const AOnChange: TKVChangeProc);
+    destructor Destroy; override;
+    function IsLive: Boolean;
+  end;
+
 implementation
+
+resourcestring
+  SKVNoChangeHandler = 'A watch needs a handler to report changes to';
 
 { TKVMemoryStore }
 
@@ -150,10 +197,13 @@ begin
   inherited Create(AClock);
   FLock := TCriticalSection.Create;
   FCollections := TObjectDictionary<string, TEntries>.Create([doOwnsValues]);
+  FWatches := TList<TKVMemoryWatch>.Create;
 end;
 
 destructor TKVMemoryStore.Destroy;
 begin
+  // Every watch holds the store, so by now there are none left.
+  FWatches.Free;
   FCollections.Free;
   FLock.Free;
   inherited;
@@ -190,6 +240,7 @@ begin
   FLock.Enter;
   try
     EntriesOf(ACollection, True).AddOrSetValue(AKey, AEntry);
+    Notify(ACollection, AKey);
   finally
     FLock.Leave;
   end;
@@ -204,7 +255,10 @@ begin
     LEntries := EntriesOf(ACollection, False);
     Result := Assigned(LEntries) and LEntries.ContainsKey(AKey);
     if Result then
+    begin
       LEntries.Remove(AKey);
+      Notify(ACollection, AKey);
+    end;
   finally
     FLock.Leave;
   end;
@@ -221,7 +275,10 @@ begin
     Result := Assigned(LEntries) and LEntries.TryGetValue(AKey, LEntry)
       and not LEntry.IsExpiredAt(ANow);
     if Assigned(LEntries) and LEntries.ContainsKey(AKey) then
+    begin
       LEntries.Remove(AKey);
+      Notify(ACollection, AKey);
+    end;
   finally
     FLock.Leave;
   end;
@@ -332,7 +389,10 @@ begin
   try
     Result := FCollections.ContainsKey(LCollection);
     if Result then
+    begin
       FCollections.Remove(LCollection);
+      Notify(LCollection, '');
+    end;
   finally
     FLock.Leave;
   end;
@@ -343,6 +403,52 @@ begin
   FLock.Enter;
   try
     FCollections.Clear;
+    Notify('', '');
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TKVMemoryStore.Notify(const ACollection, AKey: string);
+var
+  LWatch: TKVMemoryWatch;
+begin
+  for LWatch in FWatches do
+    if (ACollection = '') or (LWatch.FCollection = ACollection) then
+      try
+        LWatch.FOnChange(AKey);
+      except
+        // A handler must not raise. If one does anyway, the write it is being
+        // told about has already happened, and failing the write would report
+        // it as not having happened.
+      end;
+end;
+
+function TKVMemoryStore.Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+var
+  LWatch: TKVMemoryWatch;
+begin
+  if not Assigned(AOnChange) then
+    raise EKVArgumentError.Create(SKVNoChangeHandler);
+
+  LWatch := TKVMemoryWatch.Create(Self, ResolveCollection(ACollection), AOnChange);
+  Result := LWatch;
+
+  FLock.Enter;
+  try
+    FWatches.Add(LWatch);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TKVMemoryStore.RemoveWatch(const AWatch: TKVMemoryWatch);
+begin
+  // Under the lock, so a notification in progress finishes before the watch
+  // it is calling goes away.
+  FLock.Enter;
+  try
+    FWatches.Remove(AWatch);
   finally
     FLock.Leave;
   end;
@@ -360,6 +466,31 @@ begin
   finally
     FLock.Leave;
   end;
+end;
+
+{ TKVMemoryWatch }
+
+constructor TKVMemoryWatch.Create(const AStore: TKVMemoryStore;
+  const ACollection: string; const AOnChange: TKVChangeProc);
+begin
+  inherited Create;
+  FStore := AStore;
+  FStoreRef := AStore;
+  FCollection := ACollection;
+  FOnChange := AOnChange;
+end;
+
+destructor TKVMemoryWatch.Destroy;
+begin
+  FStore.RemoveWatch(Self);
+  FStoreRef := nil;
+  inherited;
+end;
+
+function TKVMemoryWatch.IsLive: Boolean;
+begin
+  // Nothing between the store and its watchers can drop a notification.
+  Result := True;
 end;
 
 end.

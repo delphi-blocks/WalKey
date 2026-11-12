@@ -36,8 +36,8 @@ wrapped one: a service, a typed adapter, another wrapper. Code written against
 a bare memory store in a test runs unchanged against a logged, namespaced,
 fail-over stack in production, and no line of it knows the difference.
 
-**A wrapper does one thing.** Each of the seven adds a single concern —
-naming, permission, lifetime policy, observation, resilience — and none knows
+**A wrapper does one thing.** Each of the nine adds a single concern —
+naming, permission, lifetime policy, observation, resilience, caching — and none knows
 the others exist. Combining concerns is the stack's job, not the class's.
 That is why there is no `TKVLoggedReadOnlyTenantCache`: it is three wrappers.
 
@@ -90,7 +90,7 @@ if Supports(LStore.Inner, IKeyValueCullable, LCullable) then
 
 Where a wrapper *can* honour one, it implements it: the read-only wrapper
 passes `IKeyValueEnumerable` through, because listing what is there is a read.
-The thread-safe wrapper implements all three, because a capability call it did
+The thread-safe wrapper implements all four, because a capability call it did
 not guard would slip past the lock; it raises `EKVStoreError` when the store
 underneath has none. [capabilities.md](capabilities.md) has the full table of
 which wrapper offers what.
@@ -157,10 +157,15 @@ starting point:
    not happen.
 4. **TTL clamp** — the lifetime policy, applied to everything that gets past
    the read-only check.
-5. **Prefix** (keys or collections) — last before the stores, so everything
+5. **Near cache** — over the prefix, so it caches in the caller's names, and
+   under logging and statistics, so those see every read, cached or not. It
+   needs everything beneath it to report changes, which the prefixes,
+   read-only and thread-safe do and the rest do not.
+6. **Prefix** (keys or collections) — last before the stores, so everything
    above it speaks in unprefixed names.
-6. **Fallback** — directly over the stores, so that everything above it
-   applies to both of them.
+7. **Fallback** — directly over the stores, so that everything above it
+   applies to both of them. A near cache and a fallback do not mix: the
+   fallback reports no changes, so the cache cannot go above it.
 
 A collection view taken from the top of a stack goes through all of it:
 `LStack.Collection('users')` returns a view bound to the outermost wrapper, not
@@ -599,10 +604,61 @@ processes, are not coordinated with each other.
 so the lock is not held while a log sink or an alarm callback runs. Every
 method calls `Inner` directly, so a call never nests its own lock.
 
-It implements all three optional capabilities, so a call through one is
+It implements all four optional capabilities, so a call through one is
 guarded like any other rather than reaching the store around the lock. If the
 store underneath lacks that capability, the call raises `EKVStoreError`;
 `Supports` is optimistic, exactly as it is for the prefixing wrappers.
+
+### TKVNearCacheWrapper
+
+Keeps a local copy of what is read, and drops it the moment the store reports
+that it changed. A read is served from memory, with no round trip, and still
+sees a write made by any other process.
+
+```pascal
+LShared := TKVNatsStore.Create(LJs, 'myapp');            // every instance
+LCache  := TKVNearCacheWrapper.Create(LShared, 60);      // this instance
+```
+
+It is the cache for a store that several instances share. Each instance keeps
+the values it reads close at hand, and the store tells all of them when one
+changes. That is the case the [MCPConnect example](../README.md#real-world-example-mcpconnect)
+describes: signing keys and metadata documents read on every request, written
+rarely, and shared by every instance.
+
+**It needs a store that reports changes.** The store underneath must support
+`IKeyValueWatchable` (see [capabilities.md](capabilities.md#ikeyvaluewatchable)),
+or the constructor raises `EKVArgumentError`. `TKVMemoryStore` and
+`TKVNatsStore` do, and so do the prefixing, read-only and thread-safe wrappers
+over one of them. Logging, statistics, the TTL clamp and the fallback do not,
+so they go above the cache, never below it.
+
+**How fresh a value is.** A change made through the cache is visible to its
+next read. A change made elsewhere is visible once the store reports it: at
+once for the memory store, a few milliseconds later for NATS.
+
+**`MaxAge` is the bound on what a store cannot report.** A NATS connection that
+drops and comes back between two reads, or a bucket deleted from outside, goes
+unnoticed. So nothing is served from the cache once it has been held for
+`MaxAge` seconds (60 by default), and `MaxAge` cannot be switched off.
+Everything else is noticed sooner: a watch found dead on a read discards
+everything it vouched for, and reads go uncached until a new one is live.
+
+**What it does not cache:** misses, and any value a change may have overtaken.
+If a change is reported while a read is out at the store, the read returns
+what it found but does not keep it. Under a steady stream of writes, that means
+fewer values cached, never a stale one.
+
+**Expiry** is judged here, against the cache's clock: a value expires in the
+cache when it would have expired in the store, without asking the store. Give
+the cache the store's clock if the store was given one.
+
+**Size:** `MaxEntries` (10,000 by default). Past it, the least recently read
+tenth goes at once.
+
+`Clear` drops everything, for a caller that changed the store around the cache
+in a way the store does not report. `Count` says how much is held. It offers
+no optional capabilities: reach them through `Inner`.
 
 ## Writing a wrapper
 

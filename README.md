@@ -41,14 +41,52 @@ end;
   backend has to support, so it behaves the same on every store.
 - **Collections.** Keys are grouped into named namespaces, on every backend.
 - **Wrappers that stack.** Prefixing, read-only, TTL clamping, logging,
-  statistics, fallback and thread safety, each one an `IKeyValue` around
-  another, combined in any order.
+  statistics, fallback, thread safety and a near cache, each one an
+  `IKeyValue` around another, combined in any order.
+- **A cache that stays correct across instances.** Over a store that reports
+  its changes, `TKVNearCacheWrapper` serves reads from local memory and drops
+  a value the moment any instance writes it.
 - **Typed access** with Neon: `TKVNeonAdapter<T>` stores Delphi records and 
   objects as plain JSON, readable by anything else that opens the store.
 - **No dependencies in the core.** The stores and wrappers need nothing but
   the RTL.
 - **A conformance suite.** Write a store, point the shared tests at it, and the
   whole contract is checked for you.
+
+## At a glance
+
+Three layers, each optional except the store at the bottom. Every arrow is a
+call through `IKeyValue`, except the top one, which is typed:
+
+```mermaid
+flowchart TB
+    App["Your code"]
+
+    subgraph Adapters["Typed adapters (optional)"]
+        Neon["TKVNeonAdapter#lt;T#gt;<br/><i>T #8596; JSON</i>"]
+    end
+
+    subgraph Wrappers["Wrappers (optional, stackable)"]
+        direction LR
+        W1["Logging"] --> W2["Statistics"] --> W3["Near cache"] --> W4["Prefix keys"]
+    end
+
+    subgraph Stores["Store (exactly one)"]
+        direction LR
+        Mem["Memory"]
+        File["File tree"]
+        Nats["NATS JetStream"]
+        Null["Null"]
+    end
+
+    App -- "T" --> Neon
+    App -. "string" .-> W1
+    Neon -- "string" --> W1
+    W4 -- "string" --> Stores
+```
+
+Your code may enter at any layer: straight into a store, through a stack of
+wrappers, or through an adapter on top of both.
 
 ## For framework authors
 
@@ -78,9 +116,24 @@ These are the caches that are no longer enough once the server runs as more
 than one instance: each instance fetches everything again and holds its own
 copy. Backed by an `IKeyValue`, the application decides where they live:
 
+```mermaid
+flowchart LR
+    FW["Framework<br/><i>asks for an IKeyValue</i>"]
+    App{"Application<br/>chooses"}
+
+    App -- development --> Mem["TKVMemoryStore"]
+    App -- one server --> File["TKVFileTreeStore"]
+    App -- several instances --> Nats["TKVNatsStore"]
+    App -- tests --> Null["TKVNullStore"]
+
+    Mem & File & Nats & Null -. "IKeyValue" .-> FW
+```
+
 - Development: `TKVMemoryStore` — nothing to set up
 - A single server: `TKVFileTreeStore` — the cache survives a restart
-- Several instances: `TKVNatsStore` — one shared cache for all of them
+- Several instances: `TKVNatsStore` — one shared cache for all of them, with
+  a `TKVNearCacheWrapper` in front so each instance reads from its own memory
+  and still sees what the others write
 - Tests: `TKVNullStore` — no state carried from one test to the next
 
 ### Using WalKey in your framework
@@ -142,6 +195,27 @@ application that deploys it.
   it still holds, so the in-memory store cannot quietly behave differently from
   a persistent one.
 
+How a read meets expiry. The check lives in `TKVStoreBase`, so a backend only
+ever stores and returns entries; it never decides whether one is still alive:
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant B as TKVStoreBase
+    participant S as Backend (DoTryGet)
+
+    C->>B: TryGet('123', 'users')
+    B->>B: check key, resolve collection
+    B->>S: DoTryGet('users', '123')
+    S-->>B: TKVEntry (value, created, expires)
+    alt entry expired at UtcNow
+        B->>S: DoDropExpired('users', '123')
+        B-->>C: False (a miss)
+    else entry alive
+        B-->>C: True + value
+    end
+```
+
 ## The interface
 
 ```pascal
@@ -168,7 +242,7 @@ end;
 JSON document is the empty string, so the conflation is safe; `TryGet` is there
 when the distinction matters.
 
-Three capabilities are optional, because not every backend can offer them
+Four capabilities are optional, because not every backend can offer them
 cheaply. Ask for them with `Supports`:
 
 | Interface | What it adds |
@@ -176,12 +250,65 @@ cheaply. Ask for them with `Supports`:
 | `IKeyValueEnumerable` | `Keys(collection)`, `Collections` |
 | `IKeyValueCullable` | `Cull` — sweep expired entries |
 | `IKeyValueDestroyable` | `DestroyCollection(name)`, `DestroyAll` |
+| `IKeyValueWatchable` | `Watch(collection, handler)` — be told when anyone changes a key |
 
 ## What ships today
 
+Every store descends from `TKVStoreBase`, which turns the full `IKeyValue`
+surface into three primitives. The optional capabilities are separate
+interfaces that a store adds where its backend can honour them:
+
+```mermaid
+classDiagram
+    direction TB
+    class IKeyValue {
+        <<interface>>
+        Get / TryGet / TryGetEntry / Exists
+        Put / Delete
+        GetMany / PutMany / DeleteMany
+        Collection(name)
+    }
+    class TKVStoreBase {
+        <<abstract>>
+        argument checks
+        collection resolution
+        expiry, bulk calls
+        DoTryGet()*
+        DoPut()*
+        DoDelete()*
+    }
+    class Capabilities {
+        <<optional interfaces>>
+        IKeyValueEnumerable - Keys, Collections
+        IKeyValueCullable - Cull
+        IKeyValueDestroyable - DestroyCollection, DestroyAll
+    }
+    class IKeyValueWatchable {
+        <<optional interface>>
+        Watch(collection, handler)
+    }
+
+    IKeyValue <|.. TKVStoreBase
+    TKVStoreBase <|-- TKVMemoryStore
+    TKVStoreBase <|-- TKVFileTreeStore
+    TKVStoreBase <|-- TKVNatsStore
+    TKVStoreBase <|-- TKVNullStore
+
+    TKVMemoryStore ..|> Capabilities
+    TKVFileTreeStore ..|> Capabilities
+    TKVNatsStore ..|> Capabilities
+    TKVNullStore ..|> Capabilities
+    TKVMemoryStore ..|> IKeyValueWatchable
+    TKVNatsStore ..|> IKeyValueWatchable
+```
+
+All four shipped stores offer the first three capabilities, and the memory and
+NATS stores can also be watched. A new store needs only
+the three `Do*` primitives (in italics: abstract) and may offer none of them.
+
 | Store | What it does |
 |---|---|
-| `TKVMemoryStore` | Keeps everything in memory for as long as the instance lives. Thread-safe, offers all three optional capabilities. |
+| `TKVMemoryStore` | Keeps everything in memory for as long as the instance lives. Thread-safe, offers all four optional capabilities. |
 | `TKVFileTreeStore` | Keeps everything on disk: one folder per collection, one file per entry. |
 | `TKVNullStore` | Keeps nothing: every write is accepted and discarded, every read is a miss. |
 
@@ -201,6 +328,7 @@ builds it.
 | `TKVStatisticsWrapper` | Counts gets, hits, misses, puts and deletes |
 | `TKVFallbackWrapper` | Sends everything to one store and, when that store fails, to a standby |
 | `TKVThreadSafeWrapper` | Serializes every call, so a store that does not lock itself can be shared between threads |
+| `TKVNearCacheWrapper` | Serves reads from local memory, and drops a value the moment the store reports anyone changed it |
 
 | Adapter | What it adds |
 |---|---|
@@ -224,6 +352,30 @@ begin
   LUsers.Put('alice', LUser, 3600);
   if LUsers.TryGet('alice', LUser) then
     ...
+```
+
+An adapter is not a wrapper: it does not implement `IKeyValue`, it sits on top
+of one. `TKVEntityAdapter<T>` holds the typed surface and leaves the codec
+abstract; a descendant supplies `Serialize` and `Deserialize`, and
+`TKVNeonAdapter<T>` is the one that does so with Neon:
+
+```mermaid
+flowchart LR
+    App["Your code"]
+
+    subgraph Adapter["TKVNeonAdapter#lt;TUser#gt;"]
+        direction TB
+        Typed["TKVEntityAdapter#lt;T#gt;<br/><i>Put / Get / TryGet / ...<br/>misses, ownership, bulk</i>"]
+        Codec["Codec<br/><i>Serialize / Deserialize<br/>(Neon)</i>"]
+        Typed <--> Codec
+    end
+
+    Store[("any IKeyValue<br/>store or wrapper stack")]
+
+    App -- "TUser" --> Typed
+    Typed -- "TUser" --> App
+    Codec -- "JSON text" --> Store
+    Store -- "JSON text" --> Codec
 ```
 
 Records and classes both work — a class is built fresh on every read and the
@@ -294,6 +446,28 @@ LStore :=
     begin
       Writeln(AMessage);
     end);
+```
+
+A call travels down the stack and each wrapper does its part on the way. For
+the stack above, a `Put('session-42', ..., 'sessions')` with no TTL:
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant L as Logging
+    participant S as Statistics
+    participant T as TTL clamp
+    participant P as Prefix keys
+    participant R as Store
+
+    C->>L: Put('session-42', v, 'sessions')
+    L->>L: write a log line
+    L->>S: Put(...)
+    S->>S: puts += 1
+    S->>T: Put(...)
+    T->>T: no TTL given, use 300 s
+    T->>P: Put(..., ttl 300)
+    P->>R: Put('tenant-7:session-42', v, 'sessions', 300)
 ```
 
 One rule worth knowing: **a wrapper does not pass on the optional capabilities**
@@ -368,7 +542,8 @@ BuildTests.bat 37.0 nats  REM ...and the NATS tests (library + live server)
 
 `Demos\DemoBasic` is a console tour of the whole library: the three stores,
 what TTL does (with the clock under its own control, so nothing waits), the
-wrapper stack, and typed access. It writes into a temp folder and removes it
+wrapper stack, a near cache per instance over one shared store, and typed
+access. It writes into a temp folder and removes it
 on the way out.
 
 ## Documentation
@@ -376,7 +551,7 @@ on the way out.
 | | |
 |---|---|
 | [Docs/stores.md](Docs/stores.md) | The backends, what `TKVStoreBase` handles for them, the optional capabilities, and how to write one |
-| [Docs/capabilities.md](Docs/capabilities.md) | The optional interfaces — enumerating, culling, destroying: what they promise, what they cost, and how wrappers treat them |
+| [Docs/capabilities.md](Docs/capabilities.md) | The optional interfaces — enumerating, culling, destroying, watching: what they promise, what they cost, and how wrappers treat them |
 | [Docs/wrappers.md](Docs/wrappers.md) | The stack, each wrapper, and why capabilities are not forwarded |
 | [Docs/typed-access.md](Docs/typed-access.md) | `TKVNeonAdapter<T>`: what it is for, records and classes, ownership, misses, changing a stored type, and Neon configuration |
 

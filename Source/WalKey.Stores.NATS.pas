@@ -72,7 +72,8 @@ type
   TKVNatsStore = class(TKVStoreBase,
     IKeyValueEnumerable,
     IKeyValueCullable,
-    IKeyValueDestroyable)
+    IKeyValueDestroyable,
+    IKeyValueWatchable)
   private
     FContext: TJetStreamContext;
     FBucketPrefix: string;
@@ -166,6 +167,28 @@ type
     procedure DestroyAll;
 
     /// <summary>
+    ///   Reports every write and removal in a collection, by any client of the
+    ///   bucket, through a JetStream KV watch. Changes arrive on the
+    ///   connection's reader thread, a moment after they are made.
+    /// </summary>
+    /// <remarks>
+    ///   <para>
+    ///     The watch stops being live when the connection drops, and does not
+    ///     come back when it is reopened: the subscription under it is gone.
+    ///     A connection that drops and reopens between two IsLive calls is not
+    ///     noticed, and neither is the bucket being deleted - a cache built on
+    ///     a watch needs a bound on how long it trusts what it holds.
+    ///   </para>
+    ///   <para>
+    ///     A collection with no bucket yet cannot be watched: the watch comes
+    ///     back not live, and the bucket is not created for it.
+    ///   </para>
+    /// </remarks>
+    /// <param name="ACollection">The collection to watch; '' is the default one</param>
+    /// <param name="AOnChange">Called once per change; nil is refused</param>
+    function Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+
+    /// <summary>
     ///   The bucket a collection is kept in, for anything that wants to look
     ///   at it with the NATS client directly.
     /// </summary>
@@ -202,6 +225,8 @@ resourcestring
   SKVNatsDeleteFailed = 'Could not delete key "%s" in collection "%s": %s';
   SKVNatsKeysFailed = 'Could not list collection "%s": %s';
   SKVNatsCollectionsFailed = 'Could not list the buckets: %s';
+  SKVNatsWatchFailed = 'Could not watch collection "%s": %s';
+  SKVNatsNoChangeHandler = 'A watch needs a handler to report changes to';
 
 const
   { A name that fits its namespace is stored as itself under the first mark; one
@@ -291,6 +316,56 @@ end;
 function WalKeyOf(const ANatsKey: string): string;
 begin
   Result := DecodeName(ANatsKey);
+end;
+
+type
+  /// <summary>
+  ///   A running NATS watch. Live for as long as the connection it was made on
+  ///   is up; releasing it stops the watch on the server.
+  /// </summary>
+  TKVNatsWatch = class(TInterfacedObject, IKVWatch)
+  private
+    FConnection: TNatsConnection;
+    FWatcher: IJetStreamKVWatcher;
+    FDead: Boolean;
+  public
+    constructor Create(const AConnection: TNatsConnection; const AWatcher: IJetStreamKVWatcher);
+    function IsLive: Boolean;
+  end;
+
+  /// <summary>
+  ///   What a collection that cannot be watched gets: a watch that was never
+  ///   live and reports nothing.
+  /// </summary>
+  TKVNatsDeadWatch = class(TInterfacedObject, IKVWatch)
+  public
+    function IsLive: Boolean;
+  end;
+
+{ TKVNatsWatch }
+
+constructor TKVNatsWatch.Create(const AConnection: TNatsConnection; const AWatcher: IJetStreamKVWatcher);
+begin
+  inherited Create;
+  FConnection := AConnection;
+  FWatcher := AWatcher;
+end;
+
+function TKVNatsWatch.IsLive: Boolean;
+begin
+  { Once down, the subscription is gone for good, even if the connection is
+    opened again - so a drop seen once is remembered. A benign race: two
+    threads may both write True. }
+  if not FDead and not FConnection.Connected then
+    FDead := True;
+  Result := not FDead;
+end;
+
+{ TKVNatsDeadWatch }
+
+function TKVNatsDeadWatch.IsLive: Boolean;
+begin
+  Result := False;
 end;
 
 { TKVNatsStore }
@@ -639,6 +714,50 @@ begin
 
   if Result then
     ForgetCollection(LCollection);
+end;
+
+function TKVNatsStore.Watch(const ACollection: string; const AOnChange: TKVChangeProc): IKVWatch;
+var
+  LCollection: string;
+  LBucket: string;
+  LHandle: TJetStreamKV;
+  LWatcher: IJetStreamKVWatcher;
+  LOnChange: TKVChangeProc;
+begin
+  if not Assigned(AOnChange) then
+    raise EKVArgumentError.Create(SKVNatsNoChangeHandler);
+
+  LCollection := ResolveCollection(ACollection);
+  LBucket := BucketName(LCollection);
+  LOnChange := AOnChange;
+
+  try
+    LHandle := nil;
+    try
+      LHandle := TJetStreamKV.Create(FContext, LBucket);
+      { UpdatesOnly: the watcher wants to hear about changes, and the current
+        contents are not one. The consumer exists by the time this returns,
+        so nothing written afterwards is missed. }
+      LWatcher := LHandle.WatchAll(
+        procedure (const AEntry: Nats.JetStream.KV.TKVEntry)
+        begin
+          LOnChange(WalKeyOf(AEntry.Key));
+        end,
+        [TKVWatchOption.UpdatesOnly]);
+    finally
+      LHandle.Free;
+    end;
+  except
+    on E: EJetStreamApiError do
+      if E.ErrCode = JetStreamConstants.ErrCode.STREAM_NOT_FOUND then
+        Exit(TKVNatsDeadWatch.Create)
+      else
+        raise EKVStoreError.CreateFmt(SKVNatsWatchFailed, [LCollection, E.Message]);
+    on E: ENatsException do
+      raise EKVStoreError.CreateFmt(SKVNatsWatchFailed, [LCollection, E.Message]);
+  end;
+
+  Result := TKVNatsWatch.Create(FContext.Connection, LWatcher);
 end;
 
 procedure TKVNatsStore.DestroyAll;
